@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """config.json 读写：7z 路径、密码池（含命中计数）、上次根目录、各开关状态。"""
 
+import copy
 import json
 from pathlib import Path
 
@@ -26,7 +27,9 @@ class Config:
 
     def __init__(self, path: Path | None = None):
         self.path = path or (app_dir() / CONFIG_FILE)
-        self.data = dict(DEFAULTS)
+        # 必须深拷贝：DEFAULTS 里的 passwords 是可变列表，浅拷贝会让
+        # 所有 Config 实例共享同一个密码池对象
+        self.data = copy.deepcopy(DEFAULTS)
         self.load()
 
     def load(self) -> None:
@@ -39,7 +42,7 @@ class Config:
                         self.data[key] = loaded[key]
             except (json.JSONDecodeError, OSError):
                 # 配置损坏时回退默认值，不让程序启动失败
-                self.data = dict(DEFAULTS)
+                self.data = copy.deepcopy(DEFAULTS)
 
     def save(self) -> None:
         try:

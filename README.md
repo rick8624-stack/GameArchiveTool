@@ -93,6 +93,29 @@ core/
   report.py             处理报告 CSV 导出
 ```
 
+## 测试与 CI/CD
+
+本地运行测试（无第三方依赖，找不到 7z.exe 时解压流程测试自动跳过）：
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+GitHub Actions 工作流：
+
+- **CI**（`.github/workflows/ci.yml`）：push 到 main 或提 PR 时，在 windows-latest
+  上用 Python 3.10 / 3.12 双版本跑语法检查与全部测试（运行器预装 7-Zip，
+  解压流程为真实执行）
+- **CD**（`.github/workflows/release.yml`）：推送 `v*` 标签时自动测试 → pyinstaller
+  打包单文件 exe → 发布 GitHub Release 并附上 `GameArchiveTool.exe`：
+
+  ```bash
+  git tag v1.1.0
+  git push origin v1.1.0
+  ```
+
+  也可在 GitHub 的 Actions 页面手动触发打包验证（只出构建产物，不发 Release）。
+
 ## 后续迭代方向（架构已预留）
 
 - 游戏库管理：扫描解压后的文件夹生成清单（可在 `core/` 下新增模块，复用事件队列推 UI）
