@@ -185,12 +185,18 @@ _MAGICS: tuple[tuple[bytes, str], ...] = (
     (b"PK\x03\x04", "zip"),
 )
 
-# 本质是 zip 但不该被当压缩包处理的容器格式（改了扩展名反而破坏文件）
+# 本质是 zip 但不该被当压缩包处理的容器格式（改了扩展名反而破坏文件）：
+# 办公文档/程序包等通用容器，以及游戏存档、游戏引擎资源包等游戏相关格式
 _ZIP_CONTAINER_EXTS = {
     ".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp",
     ".jar", ".war", ".apk", ".ipa", ".epub", ".xpi",
     ".whl", ".nupkg", ".vsix", ".cbz", ".aab",
+    ".save", ".sav", ".pak", ".pk3", ".pk4", ".vpk",
 }
+
+# 伪装识别的默认最小文件大小（MB）：游戏存档等小文件常用 zip 压缩存储，
+# 会被魔数误判；真正需要解压的游戏压缩包远大于此
+DEFAULT_SMART_FIX_MIN_MB = 1.0
 
 _ALL_ARCHIVE_NAME_RES = (_NNN_VOLUME_RE, _BARE_PART_RE, _PART_VOLUME_RE,
                          _R_VOLUME_RE, _Z_VOLUME_RE, _PLAIN_NNN_RE, _SINGLE_RE)
@@ -212,12 +218,15 @@ def sniff_archive_format(path: Path) -> Optional[str]:
 def fix_disguised_extensions(
     root: Path,
     log: Callable[[str, str], None],
+    min_size: int = int(DEFAULT_SMART_FIX_MIN_MB * 1024 * 1024),
 ) -> list[tuple[Path, Path]]:
     """扫描 root，找出「内容是压缩文件但扩展名不对」的伪装文件并修正扩展名。
 
     修正方式为在原名后追加正确扩展名（游戏.jpg → 游戏.jpg.rar），
     不破坏原名信息且保证后续能被压缩包识别规则命中。
-    已能按名字识别的压缩包/分卷不动；docx 等 zip 容器格式跳过。
+    三类文件不动：已能按名字识别的压缩包/分卷；docx、游戏存档（.save/.sav）、
+    引擎资源包（.pak 等）之类的 zip 容器格式；小于 min_size 字节的文件
+    （游戏存档等小文件常以 zip 格式存储，会被魔数误判为压缩包）。
     返回 [(原路径, 新路径), ...]。
     """
     fixed: list[tuple[Path, Path]] = []
@@ -229,6 +238,12 @@ def fix_disguised_extensions(
             continue  # 名字已可识别（含分卷后续卷），不需要修正
         if path.suffix.lower() in _ZIP_CONTAINER_EXTS:
             continue  # zip 容器格式，内容是 PK 头属正常，不能改名
+        if min_size > 0:
+            try:
+                if path.stat().st_size < min_size:
+                    continue  # 小文件大概率是存档/配置等，不做伪装识别
+            except OSError:
+                continue
         fmt = sniff_archive_format(path)
         if fmt is None:
             continue
@@ -437,10 +452,15 @@ def extract_batch(
             on_record(rec)
 
     smart_fix = config.data.get("smart_ext_fix", True)
+    try:
+        smart_fix_min = int(float(config.data.get(
+            "smart_fix_min_mb", DEFAULT_SMART_FIX_MIN_MB)) * 1024 * 1024)
+    except (TypeError, ValueError):
+        smart_fix_min = int(DEFAULT_SMART_FIX_MIN_MB * 1024 * 1024)
     if items is None:
         # 先做伪装扩展名修正，让后续按名字的扫描能命中这些文件
         if smart_fix:
-            for old, new in fix_disguised_extensions(scan_root, log):
+            for old, new in fix_disguised_extensions(scan_root, log, smart_fix_min):
                 emit(ExtractRecord(str(old), "成功", f"修正为 {new.name}",
                                    op="扩展名修正"))
         log(f"—— 批量解压：扫描 {scan_root} ——", "info")
@@ -503,7 +523,7 @@ def extract_batch(
             if nested_enabled and depth < MAX_NESTED_DEPTH and rec.out_dir:
                 out = Path(rec.out_dir)
                 if smart_fix:
-                    for old, new in fix_disguised_extensions(out, log):
+                    for old, new in fix_disguised_extensions(out, log, smart_fix_min):
                         emit(ExtractRecord(str(old), "成功", f"修正为 {new.name}",
                                            op="扩展名修正"))
                 new_items = [ni for ni in find_archives(out)
