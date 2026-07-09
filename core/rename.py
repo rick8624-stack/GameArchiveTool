@@ -9,12 +9,17 @@
 """
 
 import csv
+import json
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
 from utils import sanitize_filename
+
+# 重命名历史文件（放在根目录里，跟数据走），供回退使用
+HISTORY_FILE = ".rename_history.json"
 
 # 文件夹名格式：编号.名称（编号可带字母前缀，如 XB001）
 _FOLDER_RE = re.compile(r"^(?P<code>[A-Za-z]*\d+)\.(?P<name>.+)$")
@@ -106,6 +111,93 @@ def build_plans(root: Path, mapping: dict[str, str]) -> RenameScan:
             plan.note = "目标文件夹已存在，跳过"
         scan.plans.append(plan)
     return scan
+
+
+def build_default_plans(root: Path) -> RenameScan:
+    """默认编号模式：把根目录下的一级子文件夹按名称排序，重命名为 1, 2, 3...
+
+    不需要对照表；已经是目标编号的文件夹原样保留。"""
+    scan = RenameScan()
+    folders = sorted((p for p in root.iterdir() if p.is_dir()),
+                     key=lambda p: p.name)
+    for i, folder in enumerate(folders, 1):
+        new_name = str(i)
+        if folder.name == new_name:
+            continue  # 已是目标名
+        plan = FolderRenamePlan(path=folder, new_name=new_name)
+        if plan.new_path.exists():
+            plan.skip = True
+            plan.note = "目标文件夹已存在，跳过"
+        scan.plans.append(plan)
+    return scan
+
+
+# ---------- 重命名历史与回退 ----------
+
+def _history_path(root: Path) -> Path:
+    return root / HISTORY_FILE
+
+
+def _load_history(root: Path) -> list[dict]:
+    p = _history_path(root)
+    if p.exists():
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return data
+        except (json.JSONDecodeError, OSError):
+            pass
+    return []
+
+
+def record_history(root: Path, plans: list["FolderRenamePlan"]) -> int:
+    """把本批成功的重命名（旧名/新名）追加写入历史文件，供回退。返回记录条数。"""
+    entries = [{"old": str(p.path), "new": str(p.new_path)}
+               for p in plans if p.result == "成功"]
+    if not entries:
+        return 0
+    history = _load_history(root)
+    history.append({
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "renames": entries,
+    })
+    try:
+        _history_path(root).write_text(
+            json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        return 0
+    return len(entries)
+
+
+def undo_last(root: Path, log: Callable[[str, str], None]) -> tuple[int, int]:
+    """回退最近一批重命名（新名 → 旧名，逆序执行保证父子目录顺序正确）。
+
+    返回 (回退成功数, 失败数)；无历史时返回 (0, 0)。"""
+    history = _load_history(root)
+    if not history:
+        log("没有可回退的重命名历史", "warn")
+        return 0, 0
+    batch = history.pop()
+    restored = failed = 0
+    for entry in reversed(batch["renames"]):
+        new_path, old_path = Path(entry["new"]), Path(entry["old"])
+        try:
+            new_path.rename(old_path)
+            restored += 1
+            log(f"[回退] {new_path.name} → {old_path.name}", "success")
+        except OSError as e:
+            failed += 1
+            log(f"[回退失败] {new_path}：{e}", "error")
+    try:
+        if history:
+            _history_path(root).write_text(
+                json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
+        else:
+            _history_path(root).unlink(missing_ok=True)
+    except OSError:
+        pass
+    log(f"—— 回退完成（{batch['time']} 那批）：成功 {restored}，失败 {failed} ——", "info")
+    return restored, failed
 
 
 @dataclass

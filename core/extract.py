@@ -8,14 +8,29 @@
 """
 
 import re
+import shutil
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
 from core.config import Config
-from core.sevenzip import SevenZip, SevenZipResult
+from core.sevenzip import ListResult, SevenZip
 from utils import is_path_too_long
+
+# 可选依赖：装了 send2trash 则"删除原压缩包"进回收站（可恢复），
+# 没装则回退为永久删除
+try:
+    from send2trash import send2trash as _send2trash
+except ImportError:
+    _send2trash = None
+
+# 磁盘空间预检的安全余量：剩余空间需大于「未压缩总大小 + 此值」
+_FREE_SPACE_MARGIN = 64 * 1024 * 1024
+
+# 嵌套解压最大层数（压缩包里套压缩包），防止无限套娃/压缩炸弹
+MAX_NESTED_DEPTH = 4
 
 # ---------- 压缩包识别 ----------
 
@@ -27,6 +42,10 @@ _PART_VOLUME_RE = re.compile(r"(?i)^(?P<stem>.+)\.part(?P<num>\d+)\.rar$")
 _BARE_PART_RE = re.compile(r"(?i)^part(?P<num>\d+)\.rar$")
 # 旧式 rar 分卷的后续卷 .r00 .r01 ...
 _R_VOLUME_RE = re.compile(r"(?i)^(?P<stem>.+)\.r\d{2}$")
+# 旧式 zip 分卷的后续卷 .z01 .z02 ...（主卷是同名 .zip）
+_Z_VOLUME_RE = re.compile(r"(?i)^(?P<stem>.+)\.z\d{2}$")
+# 无格式中缀的纯数字分卷（HJSplit 风格：游戏.001 / 游戏.002）
+_PLAIN_NNN_RE = re.compile(r"^(?P<stem>.+)\.(?P<num>\d{3})$")
 # 普通单文件压缩包
 _SINGLE_RE = re.compile(r"(?i)^(?P<stem>.+)\.(?P<fmt>7z|zip|rar)$")
 
@@ -48,6 +67,8 @@ class ExtractRecord:
     detail: str = ""           # 失败原因或备注
     password: str = ""         # 命中的密码（无密码为空）
     elapsed: float = 0.0       # 耗时（秒）
+    out_dir: str = ""          # 实际解压目标目录（成功时非空，嵌套扫描用）
+    op: str = "解压"           # 操作类型：解压 / 扩展名修正
 
 
 def find_archives(root: Path) -> list[ArchiveItem]:
@@ -92,16 +113,36 @@ def find_archives(root: Path) -> list[ArchiveItem]:
         if _R_VOLUME_RE.match(name):
             continue  # 旧式分卷的 .rNN 后续卷，跳过（跟随主 .rar 处理）
 
+        if _Z_VOLUME_RE.match(name):
+            continue  # 旧式 zip 分卷的 .zNN 后续卷，跳过（跟随主 .zip 处理）
+
         m = _SINGLE_RE.match(name)
         if m:
             stem = m.group("stem")
-            if m.group("fmt").lower() == "rar":
+            fmt = m.group("fmt").lower()
+            if fmt == "rar":
                 # 检查是否为旧式分卷主卷（同名 .r00 存在）
                 r_vols = _collect_r_volumes(path, stem)
                 if r_vols:
                     items.append(ArchiveItem(path, [path] + r_vols, stem, "old_rar"))
                     continue
+            elif fmt == "zip":
+                # 检查是否为旧式 zip 分卷主卷（同名 .z01 存在）
+                z_vols = _collect_z_volumes(path, stem)
+                if z_vols:
+                    items.append(ArchiveItem(path, [path] + z_vols, stem, "old_zip"))
+                    continue
             items.append(ArchiveItem(path, [path], stem, "single"))
+            continue
+
+        # HJSplit 风格纯数字分卷（游戏.001，无 .7z/.zip 中缀）。
+        # 必须放在最后判断：带格式中缀的 .001 已被 _NNN_VOLUME_RE 消费
+        m = _PLAIN_NNN_RE.match(name)
+        if m:
+            if int(m.group("num")) != 1:
+                continue  # 后续卷跳过
+            volumes = _collect_plain_volumes(path, m.group("stem"))
+            items.append(ArchiveItem(path, volumes, m.group("stem"), "plain_nnn"))
     return items
 
 
@@ -123,6 +164,88 @@ def _collect_r_volumes(main_rar: Path, stem: str) -> list[Path]:
     return sorted(p for p in main_rar.parent.iterdir() if pat.match(p.name))
 
 
+def _collect_z_volumes(main_zip: Path, stem: str) -> list[Path]:
+    """收集旧式 zip 分卷的 .z01 .z02 ... 后续卷（不含主 .zip）。"""
+    pat = re.compile(rf"(?i)^{re.escape(stem)}\.z\d{{2}}$")
+    return sorted(p for p in main_zip.parent.iterdir() if pat.match(p.name))
+
+
+def _collect_plain_volumes(first: Path, stem: str) -> list[Path]:
+    """收集纯数字分卷组（游戏.001 / .002 ...）的全部文件。"""
+    pat = re.compile(rf"^{re.escape(stem)}\.\d{{3}}$")
+    return sorted(p for p in first.parent.iterdir() if pat.match(p.name))
+
+
+# ---------- 智能识别伪装扩展名 ----------
+
+# 压缩格式文件头魔数
+_MAGICS: tuple[tuple[bytes, str], ...] = (
+    (b"7z\xbc\xaf\x27\x1c", "7z"),
+    (b"Rar!\x1a\x07", "rar"),      # rar4 与 rar5 前 7 字节相同
+    (b"PK\x03\x04", "zip"),
+)
+
+# 本质是 zip 但不该被当压缩包处理的容器格式（改了扩展名反而破坏文件）
+_ZIP_CONTAINER_EXTS = {
+    ".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp",
+    ".jar", ".war", ".apk", ".ipa", ".epub", ".xpi",
+    ".whl", ".nupkg", ".vsix", ".cbz", ".aab",
+}
+
+_ALL_ARCHIVE_NAME_RES = (_NNN_VOLUME_RE, _BARE_PART_RE, _PART_VOLUME_RE,
+                         _R_VOLUME_RE, _Z_VOLUME_RE, _PLAIN_NNN_RE, _SINGLE_RE)
+
+
+def sniff_archive_format(path: Path) -> Optional[str]:
+    """读文件头魔数判断是否为压缩文件，返回 '7z'/'rar'/'zip' 或 None。"""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(8)
+    except OSError:
+        return None
+    for magic, fmt in _MAGICS:
+        if head.startswith(magic):
+            return fmt
+    return None
+
+
+def fix_disguised_extensions(
+    root: Path,
+    log: Callable[[str, str], None],
+) -> list[tuple[Path, Path]]:
+    """扫描 root，找出「内容是压缩文件但扩展名不对」的伪装文件并修正扩展名。
+
+    修正方式为在原名后追加正确扩展名（游戏.jpg → 游戏.jpg.rar），
+    不破坏原名信息且保证后续能被压缩包识别规则命中。
+    已能按名字识别的压缩包/分卷不动；docx 等 zip 容器格式跳过。
+    返回 [(原路径, 新路径), ...]。
+    """
+    fixed: list[tuple[Path, Path]] = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file():
+            continue
+        name = path.name
+        if any(r.match(name) for r in _ALL_ARCHIVE_NAME_RES):
+            continue  # 名字已可识别（含分卷后续卷），不需要修正
+        if path.suffix.lower() in _ZIP_CONTAINER_EXTS:
+            continue  # zip 容器格式，内容是 PK 头属正常，不能改名
+        fmt = sniff_archive_format(path)
+        if fmt is None:
+            continue
+        new_path = path.with_name(f"{name}.{fmt}")
+        if new_path.exists():
+            log(f"[扩展名修正] 跳过 {name}：目标 {new_path.name} 已存在", "warn")
+            continue
+        try:
+            path.rename(new_path)
+        except OSError as e:
+            log(f"[扩展名修正] 失败 {name}：{e}", "error")
+            continue
+        log(f"[扩展名修正] {name} → {new_path.name}（内容为 {fmt} 格式）", "success")
+        fixed.append((path, new_path))
+    return fixed
+
+
 # ---------- 单个压缩包的完整处理流程 ----------
 
 def extract_one(
@@ -131,10 +254,15 @@ def extract_one(
     sz: SevenZip,
     log: Callable[[str, str], None],
     file_progress: Optional[Callable[[int], None]] = None,
+    preferred_passwords: Optional[list[str]] = None,
+    dest_parent: Optional[Path] = None,
 ) -> ExtractRecord:
     """处理一个压缩包：密码尝试 → 解压 → 可选删除原包。
 
     log(msg, tag) 推送日志；file_progress(percent) 推送当前文件进度。
+    preferred_passwords 优先于密码池尝试（批次内密码局部性：同一来源的
+    游戏包通常共用密码，上一个包命中的密码先试能省掉大量无效测试）。
+    dest_parent 指定解压基准目录（目标解压路径功能），None 为压缩包所在目录。
     """
     archive = item.main_file
     start = time.time()
@@ -144,26 +272,41 @@ def extract_one(
         log(f"[跳过] 路径超过 Windows 260 字符限制：{archive}", "warn")
         return ExtractRecord(str(archive), "跳过", "路径过长", elapsed=time.time() - start)
 
-    # 确定解压目标目录
-    out_dir = archive.parent / item.stem if config.data["extract_to_subfolder"] else archive.parent
-    if is_path_too_long(out_dir):
-        log(f"[跳过] 目标路径过长：{out_dir}", "warn")
-        return ExtractRecord(str(archive), "跳过", "目标路径过长", elapsed=time.time() - start)
+    # 密码尝试顺序：无密码 → 批次内最近命中 → 密码池按命中次数降序（去重）
+    candidates = [""]
+    for pwd in (preferred_passwords or []):
+        if pwd and pwd not in candidates:
+            candidates.append(pwd)
+    for entry in config.sorted_passwords():
+        if entry["password"] not in candidates:
+            candidates.append(entry["password"])
 
-    # 密码尝试顺序：先无密码，再按命中次数降序
-    candidates = [""] + [p["password"] for p in config.sorted_passwords()]
     hit_password: Optional[str] = None
-    last_result: Optional[SevenZipResult] = None
+    listing: Optional[ListResult] = None
+    last_output = ""
 
     for pwd in candidates:
         label = "无密码" if pwd == "" else f"密码「{pwd}」"
+        # 第一道闸：7z l 只读文件头，头部加密的包密码不对时立即失败，
+        # 免去对大文件做整包 t 测试的开销
+        lr = sz.list_archive(archive, pwd)
+        if not lr.ok:
+            last_output = lr.output
+            reason = SevenZip.classify_failure(lr.output, archive)
+            if "分卷" in reason or "无法识别" in reason:
+                log(f"    快速检查失败：{reason}", "warn")
+                break
+            log(f"    {label} 快速验证未通过", "info")
+            continue
+        # 第二道闸：7z t 完整校验数据（非头部加密的包 l 会误通过）
         log(f"    测试 {label} ...", "info")
         result = sz.test(archive, pwd, progress_cb=file_progress)
-        last_result = result
         if result.ok:
             hit_password = pwd
+            listing = lr
             log(f"    {label} 验证通过", "info")
             break
+        last_output = result.output
         # 分卷不完整/根本不是压缩文件时，继续试其他密码没有意义，提前结束。
         # 注意 CRC/数据错误不提前结束——加密压缩包密码不对时也会报这类错误。
         reason = SevenZip.classify_failure(result.output, archive)
@@ -172,9 +315,32 @@ def extract_one(
             break
 
     if hit_password is None:
-        reason = SevenZip.classify_failure(last_result.output if last_result else "", archive)
+        reason = SevenZip.classify_failure(last_output, archive)
         log(f"[失败] {archive.name}：{reason}", "error")
         return ExtractRecord(str(archive), "失败", reason, elapsed=time.time() - start)
+
+    # 确定解压目标目录；包内已有唯一顶层文件夹时不再套子文件夹（避免 游戏A/游戏A/ 双重嵌套）
+    base = dest_parent if dest_parent is not None else archive.parent
+    use_subfolder = config.data["extract_to_subfolder"]
+    if use_subfolder and listing and listing.single_top_dir:
+        log(f"    包内已有唯一顶层文件夹「{listing.single_top_dir}」，"
+            "直接解压到当前目录（避免双重嵌套）", "info")
+        use_subfolder = False
+    out_dir = base / item.stem if use_subfolder else base
+    if is_path_too_long(out_dir):
+        log(f"[跳过] 目标路径过长：{out_dir}", "warn")
+        return ExtractRecord(str(archive), "跳过", "目标路径过长", elapsed=time.time() - start)
+
+    # 磁盘空间预检：剩余空间需大于未压缩总大小 + 安全余量
+    if listing and listing.total_size:
+        free = _free_space(base)
+        if free is not None and free < listing.total_size + _FREE_SPACE_MARGIN:
+            need_gb = listing.total_size / 1024 ** 3
+            free_gb = free / 1024 ** 3
+            reason = f"磁盘空间不足（需约 {need_gb:.1f} GB，剩余 {free_gb:.1f} GB）"
+            log(f"[失败] {archive.name}：{reason}", "error")
+            return ExtractRecord(str(archive), "失败", reason,
+                                 password=hit_password, elapsed=time.time() - start)
 
     # 覆盖标注：目标目录已有文件时提示 -y 会直接覆盖重名文件
     if out_dir.exists() and any(out_dir.iterdir()):
@@ -194,24 +360,166 @@ def extract_one(
     if hit_password:
         config.record_hit(hit_password)
 
-    # 可选：删除原压缩包（含分卷全部文件）
+    # 可选：删除原压缩包（含分卷全部文件）。装了 send2trash 则进回收站可恢复
     deleted_note = ""
     if config.data["delete_after_extract"]:
+        use_recycle = config.data.get("delete_to_recycle", True) and _send2trash is not None
+        how = "回收站" if use_recycle else "永久删除"
         failed_del = []
         for vol in item.volume_files:
             try:
-                vol.unlink()
+                if use_recycle:
+                    _send2trash(str(vol))
+                else:
+                    vol.unlink()
             except OSError as e:
                 failed_del.append(f"{vol.name}({e})")
         if failed_del:
             deleted_note = f"；部分原文件删除失败：{', '.join(failed_del)}"
             log(f"    原压缩包删除失败：{', '.join(failed_del)}", "warn")
         else:
-            deleted_note = f"；已删除原压缩包 {len(item.volume_files)} 个文件"
-            log(f"    已删除原压缩包（{len(item.volume_files)} 个文件）", "info")
+            deleted_note = f"；已删除原压缩包 {len(item.volume_files)} 个文件（{how}）"
+            log(f"    已删除原压缩包（{len(item.volume_files)} 个文件，{how}）", "info")
 
     elapsed = time.time() - start
     pwd_note = f"（密码：{hit_password}）" if hit_password else "（无密码）"
     log(f"[成功] {archive.name} → {out_dir} {pwd_note}，耗时 {elapsed:.1f}s{deleted_note}", "success")
     return ExtractRecord(str(archive), "成功", deleted_note.lstrip("；"),
-                         password=hit_password, elapsed=elapsed)
+                         password=hit_password, elapsed=elapsed, out_dir=str(out_dir))
+
+
+def _free_space(path: Path) -> Optional[int]:
+    """查询 path 所在磁盘的剩余空间；path 不存在时向上找最近存在的祖先目录。"""
+    p = path
+    while not p.exists():
+        parent = p.parent
+        if parent == p:
+            return None
+        p = parent
+    try:
+        return shutil.disk_usage(p).free
+    except OSError:
+        return None
+
+
+# ---------- 批量解压（含嵌套解压、目标路径、密码局部性） ----------
+
+def extract_batch(
+    config: Config,
+    sz: SevenZip,
+    log: Callable[[str, str], None],
+    scan_root: Optional[Path] = None,
+    items: Optional[list[ArchiveItem]] = None,
+    should_stop: Optional[Callable[[], bool]] = None,
+    file_progress: Optional[Callable[[int], None]] = None,
+    total_progress: Optional[Callable[[int, int, str], None]] = None,
+    on_record: Optional[Callable[[ExtractRecord], None]] = None,
+    completed: Optional[set[str]] = None,
+    mark_done: Optional[Callable[[str], None]] = None,
+) -> tuple[list[ExtractRecord], list[ArchiveItem], bool]:
+    """批量解压主循环（GUI worker 与将来的 CLI 共用）。
+
+    - items 为 None 时从 scan_root 扫描（并先做伪装扩展名修正）；
+      非 None 时只处理给定项（失败重试场景）
+    - 嵌套解压：解压成功后扫描输出目录中新出现的压缩包，继续入队处理，
+      最多 MAX_NESTED_DEPTH 层；用 seen 集合防止重复/循环
+    - 目标解压路径：config["extract_target_dir"] 非空时，顶层压缩包按
+      相对 scan_root 的目录结构解压到目标路径；嵌套项原地解压
+    - completed / mark_done：断点续传的查询与落盘回调
+    返回 (全部记录, 失败项列表, 是否被用户停止)。
+    """
+    records: list[ExtractRecord] = []
+    failed_items: list[ArchiveItem] = []
+
+    def emit(rec: ExtractRecord):
+        records.append(rec)
+        if on_record:
+            on_record(rec)
+
+    smart_fix = config.data.get("smart_ext_fix", True)
+    if items is None:
+        # 先做伪装扩展名修正，让后续按名字的扫描能命中这些文件
+        if smart_fix:
+            for old, new in fix_disguised_extensions(scan_root, log):
+                emit(ExtractRecord(str(old), "成功", f"修正为 {new.name}",
+                                   op="扩展名修正"))
+        log(f"—— 批量解压：扫描 {scan_root} ——", "info")
+        items = find_archives(scan_root)
+        log(f"共找到 {len(items)} 个压缩包（分卷已归并为首卷）", "info")
+
+    target_raw = config.data.get("extract_target_dir", "").strip()
+    target_root = Path(target_raw) if target_raw else None
+    nested_enabled = config.data.get("nested_extract", True)
+
+    queue = deque((it, 1) for it in items)          # (待处理项, 嵌套层级)
+    seen = {str(it.main_file) for it in items}      # 防重复/防循环
+    total = len(queue)
+    done = 0
+    last_hit = ""                                    # 批次内密码局部性
+    stopped = False
+
+    while queue:
+        if should_stop and should_stop():
+            log("已按用户请求停止", "warn")
+            stopped = True
+            break
+        item, depth = queue.popleft()
+        path_str = str(item.main_file)
+        if total_progress:
+            total_progress(done, total, item.main_file.name)
+
+        # 断点续传：跳过上次已完成项
+        if completed and path_str in completed:
+            log(f"[跳过] 上次已完成：{item.main_file.name}", "info")
+            emit(ExtractRecord(path_str, "跳过", "断点续传：上次已完成"))
+            done += 1
+            if total_progress:
+                total_progress(done, total, "")
+            continue
+
+        # 目标解压路径：顶层项映射到 target/相对路径；嵌套项（已在输出树内）原地
+        dest_parent = None
+        if target_root is not None and scan_root is not None:
+            try:
+                rel = item.main_file.parent.relative_to(scan_root)
+                dest_parent = target_root / rel
+            except ValueError:
+                dest_parent = None
+
+        depth_note = f"（嵌套第 {depth} 层）" if depth > 1 else ""
+        log(f"[{done + 1}/{total}] 处理 {item.main_file.name} {depth_note}", "info")
+        rec = extract_one(item, config, sz, log,
+                          file_progress=file_progress,
+                          preferred_passwords=[last_hit] if last_hit else None,
+                          dest_parent=dest_parent)
+        emit(rec)
+
+        if rec.result == "成功":
+            if mark_done:
+                mark_done(path_str)
+            if rec.password:
+                last_hit = rec.password
+            # 嵌套解压：扫描输出目录中新出现的压缩包
+            if nested_enabled and depth < MAX_NESTED_DEPTH and rec.out_dir:
+                out = Path(rec.out_dir)
+                if smart_fix:
+                    for old, new in fix_disguised_extensions(out, log):
+                        emit(ExtractRecord(str(old), "成功", f"修正为 {new.name}",
+                                           op="扩展名修正"))
+                new_items = [ni for ni in find_archives(out)
+                             if str(ni.main_file) not in seen]
+                for ni in new_items:
+                    seen.add(str(ni.main_file))
+                    queue.append((ni, depth + 1))
+                total += len(new_items)
+                if new_items:
+                    log(f"    发现 {len(new_items)} 个嵌套压缩包，"
+                        f"加入队列（第 {depth + 1} 层）", "info")
+        elif rec.result == "失败":
+            failed_items.append(item)
+
+        done += 1
+        if total_progress:
+            total_progress(done, total, "")
+
+    return records, failed_items, stopped

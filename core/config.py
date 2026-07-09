@@ -16,9 +16,15 @@ DEFAULTS = {
     "last_root": "",
     "last_csv": "",
     "delete_after_extract": False,     # 解压成功后删除原压缩包（含全部分卷）
+    "delete_to_recycle": True,         # 删除原压缩包时进回收站（需 send2trash，否则永久删除）
     "extract_to_subfolder": False,     # 解压到以压缩包名命名的子文件夹
-    "preprocess_suffix": "删",         # 预处理默认去除的末尾字符
-    "preprocess_use_regex": False,     # 预处理规则是否按正则解释
+    "extract_target_dir": "",          # 目标解压路径（留空=解压到压缩包所在目录）
+    "clean_before_extract": True,      # 批量解压前自动执行文件名清理
+    "smart_ext_fix": True,             # 智能识别伪装扩展名（按文件头魔数修正）
+    "nested_extract": True,            # 嵌套解压（压缩包里的压缩包，最多 4 层）
+    "rename_mode": "csv",              # 重命名模式：csv=对照表 / seq=默认编号 1,2,3...
+    "preprocess_suffix": "删",         # 文件名清理规则，多条用 ; 分隔
+    "preprocess_use_regex": False,     # 清理规则是否按正则解释
 }
 
 

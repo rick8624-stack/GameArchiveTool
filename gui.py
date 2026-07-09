@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """模块四：GUI 与进度可视化。
 
-主窗口：根目录选择（支持拖拽）、三个功能选项卡、双级进度条、
-彩色实时日志、状态栏计数、停止按钮。
+主窗口：根目录选择（支持拖拽）、两个功能选项卡（批量解压——内含解压前
+文件名清理、批量重命名）、双级进度条、彩色实时日志、状态栏计数、停止按钮。
 
 线程模型：所有耗时操作在工作线程执行，通过 queue.Queue 向 UI 线程
 推送事件，UI 线程用 root.after(100) 轮询队列刷新界面，绝不阻塞。
@@ -54,6 +54,9 @@ class App:
         # 预览结果暂存（UI 线程持有，确认后交给执行线程）
         self.pre_plans: list[preprocess.RenamePlan] = []
         self.folder_plans: list[rename_mod.FolderRenamePlan] = []
+        # 上次批量解压的失败项，供"重试失败项"使用
+        self.failed_items: list[extract.ArchiveItem] = []
+        self.last_scan_root: Path | None = None   # 重试时计算目标路径映射用
 
         # 报告记录与状态栏计数
         self.report_records: list[ReportRecord] = []
@@ -92,38 +95,35 @@ class App:
     def _build_tabs(self):
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill="both", expand=False, padx=8, pady=6)
-        self._build_tab_preprocess()
         self._build_tab_extract()
         self._build_tab_rename()
 
-    # ---------- 选项卡一：预处理 ----------
-
-    def _build_tab_preprocess(self):
-        tab = ttk.Frame(self.notebook, padding=8)
-        self.notebook.add(tab, text=" 预处理（文件名清理） ")
-
-        row = ttk.Frame(tab)
-        row.pack(fill="x")
-        ttk.Label(row, text="去除文件名末尾的：").pack(side="left")
-        self.pre_rule_var = tk.StringVar(value="删")
-        ttk.Entry(row, textvariable=self.pre_rule_var, width=20).pack(side="left", padx=4)
-        self.pre_regex_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(row, text="按正则解释（自动锚定末尾）",
-                        variable=self.pre_regex_var).pack(side="left", padx=8)
-        self.btn_pre_preview = ttk.Button(row, text="预览", command=self._start_pre_preview)
-        self.btn_pre_preview.pack(side="left", padx=4)
-        self.btn_pre_exec = ttk.Button(row, text="执行重命名", state="disabled",
-                                       command=self._start_pre_execute)
-        self.btn_pre_exec.pack(side="left", padx=4)
-
-        self.pre_tree = self._make_tree(tab, [("old", "原名", 380), ("new", "新名", 380),
-                                              ("note", "备注", 140)], height=8)
-
-    # ---------- 选项卡二：解压 ----------
+    # ---------- 选项卡一：批量解压（含解压前文件名清理） ----------
 
     def _build_tab_extract(self):
         tab = ttk.Frame(self.notebook, padding=8)
         self.notebook.add(tab, text=" 批量解压 ")
+
+        # 第零行：文件名清理（原预处理模块，已并入解压流水线）
+        clean = ttk.LabelFrame(tab, text="文件名清理（解压前预处理）", padding=4)
+        clean.pack(fill="x", pady=(0, 4))
+        row0 = ttk.Frame(clean)
+        row0.pack(fill="x")
+        ttk.Label(row0, text="去除文件名末尾的：").pack(side="left")
+        self.pre_rule_var = tk.StringVar(value="删")
+        ttk.Entry(row0, textvariable=self.pre_rule_var, width=24).pack(side="left", padx=4)
+        ttk.Label(row0, text="（多条规则用 ; 分隔）", foreground="#888").pack(side="left")
+        self.pre_regex_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row0, text="按正则解释",
+                        variable=self.pre_regex_var).pack(side="left", padx=8)
+        self.clean_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row0, text="解压前自动清理",
+                        variable=self.clean_var).pack(side="left", padx=8)
+        self.btn_pre_preview = ttk.Button(row0, text="预览清理", command=self._start_pre_preview)
+        self.btn_pre_preview.pack(side="left", padx=4)
+        self.btn_pre_exec = ttk.Button(row0, text="执行清理", state="disabled",
+                                       command=self._start_pre_execute)
+        self.btn_pre_exec.pack(side="left", padx=4)
 
         # 第一行：7z 路径
         row1 = ttk.Frame(tab)
@@ -134,6 +134,17 @@ class App:
                                                             expand=True, padx=4)
         ttk.Button(row1, text="浏览...", command=self._browse_7z).pack(side="left")
 
+        # 第 1.5 行：目标解压路径
+        row1b = ttk.Frame(tab)
+        row1b.pack(fill="x", pady=(4, 0))
+        ttk.Label(row1b, text="目标解压路径：").pack(side="left")
+        self.target_var = tk.StringVar()
+        ttk.Entry(row1b, textvariable=self.target_var).pack(side="left", fill="x",
+                                                            expand=True, padx=4)
+        ttk.Button(row1b, text="浏览...", command=self._browse_target).pack(side="left")
+        ttk.Label(row1b, text="（留空=解压到压缩包所在目录）",
+                  foreground="#888").pack(side="left", padx=4)
+
         # 第二行：开关
         row2 = ttk.Frame(tab)
         row2.pack(fill="x", pady=4)
@@ -142,7 +153,13 @@ class App:
                         variable=self.subfolder_var).pack(side="left")
         self.delete_var = tk.BooleanVar()
         ttk.Checkbutton(row2, text="解压成功后删除原压缩包（含全部分卷）",
-                        variable=self.delete_var).pack(side="left", padx=16)
+                        variable=self.delete_var).pack(side="left", padx=12)
+        self.smart_fix_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row2, text="智能识别伪装扩展名",
+                        variable=self.smart_fix_var).pack(side="left", padx=12)
+        self.nested_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row2, text="嵌套解压（最多4层）",
+                        variable=self.nested_var).pack(side="left", padx=12)
 
         # 第三行：密码池 + 操作按钮
         row3 = ttk.Frame(tab)
@@ -166,17 +183,33 @@ class App:
         self.btn_extract = ttk.Button(act_frame, text="开始批量解压",
                                       command=self._start_extract)
         self.btn_extract.pack(fill="x", pady=4)
+        self.btn_retry = ttk.Button(act_frame, text="重试失败项", state="disabled",
+                                    command=self._start_retry_failed)
+        self.btn_retry.pack(fill="x", pady=4)
         ttk.Button(act_frame, text="导出处理报告 CSV",
                    command=self._export_report).pack(fill="x", pady=4)
 
-    # ---------- 选项卡三：重命名 ----------
+    # ---------- 选项卡二：重命名 ----------
 
     def _build_tab_rename(self):
         tab = ttk.Frame(self.notebook, padding=8)
         self.notebook.add(tab, text=" 批量重命名（编号对照表） ")
 
+        # 模式选择：对照表（CSV）或默认编号（1,2,3...，无需对照表）
+        rowm = ttk.Frame(tab)
+        rowm.pack(fill="x")
+        ttk.Label(rowm, text="模式：").pack(side="left")
+        self.ren_mode_var = tk.StringVar(value="csv")
+        ttk.Radiobutton(rowm, text="对照表（编号→英文名）", value="csv",
+                        variable=self.ren_mode_var).pack(side="left", padx=4)
+        ttk.Radiobutton(rowm, text="默认编号（一级子文件夹按序改为 1, 2, 3...）",
+                        value="seq", variable=self.ren_mode_var).pack(side="left", padx=4)
+        self.btn_ren_undo = ttk.Button(rowm, text="回退上次重命名",
+                                       command=self._start_ren_undo)
+        self.btn_ren_undo.pack(side="right", padx=4)
+
         row = ttk.Frame(tab)
-        row.pack(fill="x")
+        row.pack(fill="x", pady=(4, 0))
         ttk.Label(row, text="CSV 对照表（编号,英文名）：").pack(side="left")
         self.csv_var = tk.StringVar()
         ttk.Entry(row, textvariable=self.csv_var).pack(side="left", fill="x",
@@ -269,6 +302,11 @@ class App:
         self.csv_var.set(d["last_csv"])
         self.subfolder_var.set(d["extract_to_subfolder"])
         self.delete_var.set(d["delete_after_extract"])
+        self.clean_var.set(d["clean_before_extract"])
+        self.target_var.set(d["extract_target_dir"])
+        self.smart_fix_var.set(d["smart_ext_fix"])
+        self.nested_var.set(d["nested_extract"])
+        self.ren_mode_var.set(d["rename_mode"])
         self.pre_rule_var.set(d["preprocess_suffix"])
         self.pre_regex_var.set(d["preprocess_use_regex"])
         self._refresh_pw_list()
@@ -281,6 +319,11 @@ class App:
         d["last_csv"] = self.csv_var.get().strip()
         d["extract_to_subfolder"] = self.subfolder_var.get()
         d["delete_after_extract"] = self.delete_var.get()
+        d["clean_before_extract"] = self.clean_var.get()
+        d["extract_target_dir"] = self.target_var.get().strip()
+        d["smart_ext_fix"] = self.smart_fix_var.get()
+        d["nested_extract"] = self.nested_var.get()
+        d["rename_mode"] = self.ren_mode_var.get()
         d["preprocess_suffix"] = self.pre_rule_var.get()
         d["preprocess_use_regex"] = self.pre_regex_var.get()
         self.config.save()
@@ -302,6 +345,11 @@ class App:
                                           filetypes=[("7z.exe", "7z.exe"), ("所有文件", "*.*")])
         if path:
             self.sz_path_var.set(str(Path(path)))
+
+    def _browse_target(self):
+        path = filedialog.askdirectory(title="选择目标解压路径")
+        if path:
+            self.target_var.set(str(Path(path)))
 
     def _browse_csv(self):
         path = filedialog.askopenfilename(title="选择对照表 CSV",
@@ -393,8 +441,11 @@ class App:
     def _set_running(self, running: bool):
         state = "disabled" if running else "normal"
         for btn in (self.btn_pre_preview, self.btn_pre_exec, self.btn_extract,
-                    self.btn_ren_preview, self.btn_ren_exec):
+                    self.btn_ren_preview, self.btn_ren_exec, self.btn_ren_undo):
             btn.configure(state=state)
+        # 重试按钮只有存在失败项时才恢复可用
+        self.btn_retry.configure(
+            state="normal" if (not running and self.failed_items) else "disabled")
         self.btn_stop.configure(state="normal" if running else "disabled")
         if running:
             self.file_bar.configure(value=0)
@@ -445,6 +496,8 @@ class App:
             self._show_pre_plans(ev["plans"])
         elif t == "ren_scan":
             self._show_ren_scan(ev["scan"])
+        elif t == "failures":
+            self.failed_items = ev["items"]
         elif t == "done":
             self._set_running(False)
 
@@ -471,22 +524,22 @@ class App:
         self._start_worker(self._worker_pre_preview, root_dir, rule, use_regex)
 
     def _worker_pre_preview(self, root_dir: Path, rule: str, use_regex: bool):
-        self._wlog(f"—— 预处理预览：扫描 {root_dir} ——", "info")
+        self._wlog(f"—— 文件名清理预览：扫描 {root_dir} ——", "info")
         plans, err = preprocess.build_plans(root_dir, rule, use_regex)
         if err:
             self._wlog(f"[错误] {err}", "error")
             return
-        self._wlog(f"扫描完成，共找到 {len(plans)} 个待重命名文件", "info")
+        for p in plans:
+            note = f"（{p.note}）" if p.note else ""
+            self._wlog(f"    {p.path.name} → {p.new_name} {note}",
+                       "warn" if p.skip else "info")
+        self._wlog(f"扫描完成，共找到 {len(plans)} 个待重命名文件；"
+                   "确认无误后点「执行清理」", "info")
         self._emit(type="pre_plans", plans=plans)
 
     def _show_pre_plans(self, plans: list[preprocess.RenamePlan]):
         self.pre_plans = plans
-        self.pre_tree.delete(*self.pre_tree.get_children())
-        for p in plans:
-            self.pre_tree.insert("", "end", values=(p.path.name, p.new_name, p.note))
         self.btn_pre_exec.configure(state="normal" if plans else "disabled")
-        if plans:
-            self.notebook.select(0)
 
     def _start_pre_execute(self):
         if not self.pre_plans:
@@ -545,59 +598,61 @@ class App:
                 self.progress_store.clear()
 
         self._reset_counts()
+        self.last_scan_root = root_dir
         self._start_worker(self._worker_extract, root_dir, sz, skip_done)
 
-    def _worker_extract(self, root_dir: Path, sz: SevenZip, skip_done: bool):
-        self._wlog(f"—— 批量解压：扫描 {root_dir} ——", "info")
-        items = extract.find_archives(root_dir)
-        self._wlog(f"共找到 {len(items)} 个压缩包（分卷已归并为首卷）", "info")
+    def _start_retry_failed(self):
+        """仅重新处理上次批量解压的失败项（例如补了密码/补齐分卷之后）。"""
+        if not self.failed_items:
+            return
+        sz = SevenZip(self.sz_path_var.get().strip())
+        if not sz.available():
+            messagebox.showerror("错误", f"未找到 7z.exe：{sz.exe_path}")
+            return
+        items, self.failed_items = self.failed_items, []
+        self._reset_counts()
+        self._start_worker(self._worker_extract, None, sz, False, items)
 
-        failures: list[extract.ExtractRecord] = []
-        total = len(items)
-        self._emit(type="total", current=0, total=total)
-        stopped = False
-
-        for i, item in enumerate(items, 1):
+    def _worker_extract(self, root_dir: Path | None, sz: SevenZip,
+                        skip_done: bool, retry_items: list | None = None):
+        # 解压前流水线第一步：文件名清理（把"游戏.7z.001删"修正为可识别的分卷名）
+        if retry_items is None and self.config.data["clean_before_extract"]:
+            self._run_cleanup_phase(root_dir)
             if self.stop_event.is_set():
-                self._wlog("已按用户请求停止", "warn")
-                stopped = True
-                break
+                return
 
-            path_str = str(item.main_file)
-            self._emit(type="total", current=i - 1, total=total, name=item.main_file.name)
+        if retry_items is not None:
+            self._wlog(f"—— 重试上次失败的 {len(retry_items)} 个压缩包 ——", "info")
 
-            # 断点续传：跳过上次已完成的压缩包
-            if skip_done and self.progress_store.is_done(path_str):
-                self._wlog(f"[跳过] 上次已完成：{item.main_file.name}", "info")
-                self._emit(type="count", kind="跳过")
-                self._emit(type="total", current=i, total=total)
-                continue
-
-            self._wlog(f"[{i}/{total}] 处理 {item.main_file.name}", "info")
-            record = extract.extract_one(
-                item, self.config, sz, self._wlog,
-                file_progress=lambda p: self._emit(type="file", percent=p),
-            )
+        def on_record(rec: extract.ExtractRecord):
+            """每处理完一项：写入报告 + 更新状态栏计数。"""
             self.report_records.append(ReportRecord(
-                record.archive, "解压", record.result,
-                record.detail, record.password, record.elapsed))
+                rec.archive, rec.op, rec.result,
+                rec.detail, rec.password, rec.elapsed))
+            if rec.op == "解压":
+                self._emit(type="count", kind=rec.result)
 
-            if record.result == "成功":
-                # 每完成一个立即写入 progress.json，支持断点续传
-                self.progress_store.mark_done(path_str)
-                self._emit(type="count", kind="成功")
-            elif record.result == "失败":
-                failures.append(record)
-                self._emit(type="count", kind="失败")
-            else:
-                self._emit(type="count", kind="跳过")
-            self._emit(type="total", current=i, total=total)
+        # 批量循环（含嵌套解压/目标路径/密码局部性）在 core.extract_batch 中
+        records, failed_items, stopped = extract.extract_batch(
+            self.config, sz, self._wlog,
+            scan_root=root_dir if root_dir is not None else self.last_scan_root,
+            items=retry_items,
+            should_stop=self.stop_event.is_set,
+            file_progress=lambda p: self._emit(type="file", percent=p),
+            total_progress=lambda c, t, n: self._emit(
+                type="total", current=c, total=t, name=n),
+            on_record=on_record,
+            completed=set(self.progress_store.completed) if skip_done else None,
+            mark_done=self.progress_store.mark_done,
+        )
 
-        # 失败清单汇总
+        # 失败清单汇总；失败项交回 UI 线程供"重试失败项"使用
+        failures = [r for r in records if r.op == "解压" and r.result == "失败"]
         if failures:
-            self._wlog(f"—— 失败清单（{len(failures)} 项）——", "error")
+            self._wlog(f"—— 失败清单（{len(failures)} 项，可点「重试失败项」重跑）——", "error")
             for r in failures:
                 self._wlog(f"  {r.archive}  →  {r.detail}", "error")
+        self._emit(type="failures", items=failed_items)
 
         if stopped:
             self._wlog("—— 任务已停止（进度已保存，可断点续传）——", "warn")
@@ -606,17 +661,45 @@ class App:
             self.progress_store.clear()
             self._wlog("—— 批量解压完成，可在解压选项卡导出处理报告 ——", "info")
 
+    def _run_cleanup_phase(self, root_dir: Path):
+        """解压流水线的文件名清理阶段：按当前规则直接执行（逐条记日志）。"""
+        rules = self.config.data["preprocess_suffix"]
+        use_regex = self.config.data["preprocess_use_regex"]
+        plans, err = preprocess.build_plans(root_dir, rules, use_regex)
+        if err:
+            self._wlog(f"[清理] 规则无效，跳过清理阶段：{err}", "warn")
+            return
+        if not plans:
+            return
+        self._wlog(f"—— 解压前文件名清理：{len(plans)} 项 ——", "info")
+        preprocess.execute_plans(plans, self._wlog,
+                                 should_stop=self.stop_event.is_set)
+        for p in plans:
+            if p.result:
+                self.report_records.append(
+                    ReportRecord(str(p.path), "预处理", p.result, p.note))
+
     # ================= 模块三：批量重命名 =================
 
     def _start_ren_preview(self):
         root_dir = self._get_root_dir()
         if root_dir is None:
             return
+        if self.ren_mode_var.get() == "seq":
+            # 默认编号模式：无需对照表
+            self._start_worker(self._worker_ren_preview_seq, root_dir)
+            return
         csv_raw = self.csv_var.get().strip()
         if not csv_raw or not Path(csv_raw).is_file():
             messagebox.showerror("错误", "请先选择有效的 CSV 对照表文件")
             return
         self._start_worker(self._worker_ren_preview, root_dir, Path(csv_raw))
+
+    def _worker_ren_preview_seq(self, root_dir: Path):
+        self._wlog(f"—— 默认编号预览：{root_dir} 的一级子文件夹 → 1, 2, 3... ——", "info")
+        scan = rename_mod.build_default_plans(root_dir)
+        self._wlog(f"共 {len(scan.plans)} 个文件夹待重命名", "info")
+        self._emit(type="ren_scan", scan=scan)
 
     def _worker_ren_preview(self, root_dir: Path, csv_path: Path):
         self._wlog(f"—— 重命名预览：读取对照表 {csv_path.name} ——", "info")
@@ -644,20 +727,35 @@ class App:
             self.unmatched_list.insert(tk.END, str(p))
         self.btn_ren_exec.configure(state="normal" if scan.plans else "disabled")
         if scan.plans or scan.unmatched:
-            self.notebook.select(2)
+            self.notebook.select(1)  # 重命名选项卡（预处理并入解压后为第二个）
 
     def _start_ren_execute(self):
         if not self.folder_plans:
             return
+        root_dir = self._get_root_dir()
+        if root_dir is None:
+            return
         n = sum(1 for p in self.folder_plans if not p.skip)
-        if not messagebox.askyesno("确认执行", f"将重命名 {n} 个文件夹，是否继续？"):
+        if not messagebox.askyesno("确认执行", f"将重命名 {n} 个文件夹，是否继续？\n"
+                                             "（可通过「回退上次重命名」恢复）"):
             return
         self._reset_counts()
         plans, self.folder_plans = self.folder_plans, []
         self.btn_ren_exec.configure(state="disabled")
-        self._start_worker(self._worker_ren_execute, plans)
+        self._start_worker(self._worker_ren_execute, plans, root_dir)
 
-    def _worker_ren_execute(self, plans):
+    def _start_ren_undo(self):
+        root_dir = self._get_root_dir()
+        if root_dir is None:
+            return
+        if not messagebox.askyesno("确认回退", "回退最近一批文件夹重命名（新名改回旧名）？"):
+            return
+        self._start_worker(self._worker_ren_undo, root_dir)
+
+    def _worker_ren_undo(self, root_dir: Path):
+        rename_mod.undo_last(root_dir, self._wlog)
+
+    def _worker_ren_execute(self, plans, root_dir: Path):
         self._wlog("—— 开始执行文件夹重命名 ——", "info")
 
         def log_and_count(msg, tag):
@@ -674,6 +772,10 @@ class App:
         for p in plans:
             if p.result:  # 空 result 表示因停止而未执行，不计入报告
                 self.report_records.append(ReportRecord(str(p.path), "重命名", p.result, p.note))
+        # 写入重命名历史（根目录下 .rename_history.json），供一键回退
+        saved = rename_mod.record_history(root_dir, plans)
+        if saved:
+            self._wlog(f"已保存重命名历史 {saved} 条，可通过「回退上次重命名」恢复", "info")
         self._wlog(f"—— 重命名完成：成功 {result.renamed}，跳过 {result.skipped}，"
                    f"失败 {result.failed} ——", "info")
 

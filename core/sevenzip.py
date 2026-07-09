@@ -26,6 +26,27 @@ class SevenZipResult:
         return self.returncode == 0
 
 
+class ListResult:
+    """7z l 列表结果：用于快速密码验证、双重嵌套判断和磁盘空间预检。"""
+
+    def __init__(self, ok: bool, output: str, top_names: set[str],
+                 top_dirs: set[str], total_size: int):
+        self.ok = ok
+        self.output = output
+        self.top_names = top_names     # 压缩包内的顶层条目名集合
+        self.top_dirs = top_dirs       # 顶层条目中是文件夹的那些
+        self.total_size = total_size   # 未压缩总大小（字节）
+
+    @property
+    def single_top_dir(self) -> str | None:
+        """包内是否只有唯一的顶层文件夹（用于避免解压双重嵌套）。"""
+        if len(self.top_names) == 1:
+            name = next(iter(self.top_names))
+            if name in self.top_dirs:
+                return name
+        return None
+
+
 class SevenZip:
     def __init__(self, exe_path: str):
         self.exe_path = exe_path
@@ -116,6 +137,68 @@ class SevenZip:
             ["x", str(archive), f"-o{out_dir}", f"-p{password}", "-y", "-bsp1"],
             progress_cb,
         )
+
+    def list_archive(self, archive: Path, password: str = "") -> ListResult:
+        """7z l -slt 快速列出压缩包内容（只读文件头，不解数据）。
+
+        三个用途：
+        1. 密码快速验证：头部加密的压缩包密码不对时立即失败，
+           避免对大文件做整包 t 测试才发现密码错误
+        2. 顶层条目集合：判断包内是否已有唯一顶层文件夹（避免双重嵌套）
+        3. 未压缩总大小：解压前做磁盘空间预检
+
+        注意：非头部加密的包用错误密码 l 也会成功，所以 l 通过只是
+        必要条件，真正的密码确认仍靠 7z t。
+        """
+        cmd = [self.exe_path, "l", str(archive), f"-p{password}",
+               "-slt", "-ba", "-sccUTF-8"]
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=CREATE_NO_WINDOW,
+            )
+        except OSError as e:
+            return ListResult(False, f"无法启动 7z.exe：{e}", set(), set(), 0)
+
+        output = (proc.stdout or "") + (proc.stderr or "")
+        if proc.returncode != 0:
+            return ListResult(False, output, set(), set(), 0)
+
+        # -slt 输出为「键 = 值」块，逐行提取 Path / Size / Attributes
+        top_names: set[str] = set()
+        top_dirs: set[str] = set()
+        total_size = 0
+        cur_path = ""          # 当前块的 Path（-slt 中 Path 总在块首）
+        cur_is_top = False     # 当前块的条目是否是顶层条目
+        for line in proc.stdout.splitlines():
+            if line.startswith("Path = "):
+                rel = line[len("Path = "):].strip()
+                parts = re.split(r"[\\/]", rel, maxsplit=1)
+                cur_path = parts[0]
+                cur_is_top = len(parts) == 1
+                if rel:
+                    # 顶层名 = 第一个路径段（7z 在 Windows 上用反斜杠）
+                    top_names.add(parts[0])
+                    if not cur_is_top:
+                        top_dirs.add(parts[0])  # 有子路径 → 顶层段必是文件夹
+            elif line.startswith("Size = "):
+                v = line[len("Size = "):].strip()
+                if v.isdigit():
+                    total_size += int(v)
+            elif line.startswith("Folder = ") and cur_is_top:
+                if line[len("Folder = "):].strip() == "+":
+                    top_dirs.add(cur_path)
+            elif line.startswith("Attributes = ") and cur_is_top:
+                # 目录属性以 D 开头（如 "D_ drwxr-xr-x"）
+                if line[len("Attributes = "):].strip().startswith("D"):
+                    top_dirs.add(cur_path)
+        # 成功时不保留原始输出（大压缩包的文件清单可能非常大，且只有
+        # 失败时才需要拿输出做原因分类）
+        return ListResult(True, "", top_names, top_dirs, total_size)
 
     # ---------- 失败原因分类 ----------
 

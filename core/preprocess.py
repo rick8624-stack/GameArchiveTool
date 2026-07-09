@@ -33,34 +33,55 @@ class PreprocessResult:
     errors: list[str] = field(default_factory=list)
 
 
-def build_plans(root: Path, rule: str, use_regex: bool) -> tuple[list[RenamePlan], Optional[str]]:
+def parse_rules(rules: str | list[str]) -> list[str]:
+    """规则解析：字符串按 ; 或 ；分隔为多条规则（普通模式下规则本身
+    因此不能包含分号，正则里可用 \\x3b 表示分号）。"""
+    if isinstance(rules, str):
+        parts = re.split(r"[;；]", rules)
+    else:
+        parts = rules
+    return [p for p in (s.strip() for s in parts) if p]
+
+
+def build_plans(root: Path, rules: str | list[str],
+                use_regex: bool) -> tuple[list[RenamePlan], Optional[str]]:
     """扫描 root，按规则生成重命名计划。
 
-    rule 为要去除的末尾字符（普通模式）或正则（正则模式，自动锚定到末尾）。
-    返回 (计划列表, 错误信息)；正则非法时错误信息非 None。
+    rules 为要去除的末尾字符（普通模式）或正则（正则模式，自动锚定到末尾），
+    支持多条规则（; 分隔），按顺序依次应用到文件名末尾。
+    返回 (计划列表, 错误信息)；规则非法时错误信息非 None。
     """
-    if not rule:
+    rule_list = parse_rules(rules)
+    if not rule_list:
         return [], "清理规则不能为空"
 
-    pattern = None
+    patterns: list[re.Pattern] = []
     if use_regex:
-        try:
-            # 自动加 (?:...)$ 锚定末尾，用户只需写要匹配的尾部内容
-            pattern = re.compile(f"(?:{rule})$")
-        except re.error as e:
-            return [], f"正则表达式无效：{e}"
+        for rule in rule_list:
+            try:
+                # 自动加 (?:...)$ 锚定末尾，用户只需写要匹配的尾部内容
+                patterns.append(re.compile(f"(?:{rule})$"))
+            except re.error as e:
+                return [], f"正则表达式「{rule}」无效：{e}"
 
     plans: list[RenamePlan] = []
     for path in sorted(root.rglob("*")):
         if not path.is_file():
             continue
         name = path.name
+        new_name = name
+        # 多条规则按顺序各应用一次
         if use_regex:
-            new_name = pattern.sub("", name)
+            for pat in patterns:
+                new_name = pat.sub("", new_name)
         else:
-            new_name = name[: -len(rule)] if name.endswith(rule) else name
+            for rule in rule_list:
+                if new_name.endswith(rule):
+                    new_name = new_name[: -len(rule)]
+        # 去掉清理后残留的末尾空格（Windows 文件名不允许以空格结尾）
+        new_name = new_name.rstrip()
 
-        if new_name == name or not new_name.strip():
+        if new_name == name or not new_name:
             continue  # 不匹配规则，或去掉后缀后为空名，跳过
 
         plan = RenamePlan(path=path, new_name=new_name)
