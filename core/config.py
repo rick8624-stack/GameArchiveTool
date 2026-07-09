@@ -21,6 +21,7 @@ DEFAULTS = {
     "extract_target_dir": "",          # 目标解压路径（留空=解压到压缩包所在目录）
     "clean_before_extract": True,      # 批量解压前自动执行文件名清理
     "smart_ext_fix": True,             # 智能识别伪装扩展名（按文件头魔数修正）
+    "smart_fix_min_mb": 1.0,           # 小于此大小(MB)的文件不做伪装识别（防游戏存档误判）
     "nested_extract": True,            # 嵌套解压（压缩包里的压缩包，最多 4 层）
     "rename_mode": "csv",              # 重命名模式：csv=对照表 / seq=默认编号 1,2,3...
     "preprocess_suffix": "删",         # 文件名清理规则，多条用 ; 分隔

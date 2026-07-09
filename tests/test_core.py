@@ -229,7 +229,8 @@ class TestSniffDisguise(TempDirTestCase):
         # 分卷后续卷 → 不动（名字已被分卷规则覆盖）
         (self.work / "游戏.7z.002").write_bytes(b"7z\xbc\xaf\x27\x1c")
 
-        fixed = extract.fix_disguised_extensions(self.work, self.quiet_log)
+        # min_size=0：本用例只验证格式判断，大小门槛单独测
+        fixed = extract.fix_disguised_extensions(self.work, self.quiet_log, min_size=0)
         names = sorted(p.name for p in self.work.iterdir())
         self.assertIn("伪装照片.jpg.zip", names)
         self.assertIn("假数据.dat.rar", names)
@@ -238,6 +239,32 @@ class TestSniffDisguise(TempDirTestCase):
         self.assertIn("正常.zip", names)
         self.assertIn("游戏.7z.002", names)
         self.assertEqual(len(fixed), 2)
+
+    def test_game_save_files_not_touched(self):
+        """游戏存档防误判：.save/.sav/.pak 即使内容是 zip 也不改名。"""
+        import zipfile
+        for name in ["进度.save", "存档.sav", "资源.pak"]:
+            with zipfile.ZipFile(self.work / name, "w") as z:
+                z.writestr("data", "x" * 4096)
+        fixed = extract.fix_disguised_extensions(self.work, self.quiet_log, min_size=0)
+        self.assertEqual(fixed, [])
+        names = sorted(p.name for p in self.work.iterdir())
+        self.assertEqual(names, ["存档.sav", "资源.pak", "进度.save"])
+
+    def test_min_size_gate(self):
+        """大小门槛：小于阈值的伪装文件不识别（1KB-100KB 的存档类小文件）。"""
+        import zipfile
+        with zipfile.ZipFile(self.work / "小存档.dat", "w") as z:
+            z.writestr("s", "x" * 1024)   # 几 KB 的小 zip
+        with zipfile.ZipFile(self.work / "大游戏.dat", "w") as z:
+            z.writestr("b", os.urandom(300 * 1024))  # 超过阈值
+
+        fixed = extract.fix_disguised_extensions(
+            self.work, self.quiet_log, min_size=200 * 1024)
+        self.assertEqual(len(fixed), 1)
+        names = sorted(p.name for p in self.work.iterdir())
+        self.assertIn("小存档.dat", names)      # 低于阈值，原样保留
+        self.assertIn("大游戏.dat.zip", names)  # 超过阈值，正常修正
 
 
 # ================= 模块二：解压流程（需要 7z.exe） =================
@@ -442,11 +469,36 @@ class TestExtractFlow(TempDirTestCase):
         with zipfile.ZipFile(root / "截图.jpg", "w") as z:
             z.writestr("真实内容.txt", "hidden")
 
+        self.cfg.data["smart_fix_min_mb"] = 0  # 测试文件很小，关闭大小门槛
         records, _, _ = extract.extract_batch(
             self.cfg, self.sz, self.quiet_log, scan_root=root)
         self.assertTrue(any(r.op == "扩展名修正" for r in records))
         self.assertTrue((root / "截图.jpg.zip").exists())
         self.assertTrue((root / "真实内容.txt").exists())
+
+    def test_nested_skips_small_save_files(self):
+        """嵌套解压 + 默认大小门槛：解出的游戏小存档不被误判为压缩包再解一层。"""
+        import zipfile
+        root = self.work / "root"
+        root.mkdir()
+        stage = self.work / "stage"
+        stage.mkdir()
+        # 存档：zip 格式、几 KB、.save 后缀——三重特征都不该被碰
+        with zipfile.ZipFile(stage / "进度.save", "w") as z:
+            z.writestr("slot1", "x" * 2048)
+        # 再放一个伪装但同样小的文件，验证大小门槛在嵌套轮次也生效
+        with zipfile.ZipFile(stage / "配置.cfg", "w") as z:
+            z.writestr("cfg", "y" * 2048)
+        self.run7z("a", str(root / "游戏.7z"), str(stage / "*"))
+
+        # 默认配置：smart_fix_min_mb = 1.0
+        records, _, _ = extract.extract_batch(
+            self.cfg, self.sz, self.quiet_log, scan_root=root)
+        self.assertFalse(any(r.op == "扩展名修正" for r in records))
+        ex = [r for r in records if r.op == "解压"]
+        self.assertEqual(len(ex), 1)  # 只解了外层，存档/配置原样保留
+        self.assertTrue((root / "进度.save").exists())
+        self.assertTrue((root / "配置.cfg").exists())
 
     def test_extract_target_dir(self):
         """目标解压路径：按相对扫描根目录的结构解压到指定目录。"""

@@ -155,8 +155,12 @@ class App:
         ttk.Checkbutton(row2, text="解压成功后删除原压缩包（含全部分卷）",
                         variable=self.delete_var).pack(side="left", padx=12)
         self.smart_fix_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row2, text="智能识别伪装扩展名",
-                        variable=self.smart_fix_var).pack(side="left", padx=12)
+        ttk.Checkbutton(row2, text="智能识别伪装扩展名（≥",
+                        variable=self.smart_fix_var).pack(side="left", padx=(12, 0))
+        self.smart_fix_min_var = tk.StringVar(value="1")
+        ttk.Entry(row2, textvariable=self.smart_fix_min_var,
+                  width=5, justify="center").pack(side="left")
+        ttk.Label(row2, text="MB 才识别，防存档误判）").pack(side="left")
         self.nested_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(row2, text="嵌套解压（最多4层）",
                         variable=self.nested_var).pack(side="left", padx=12)
@@ -305,6 +309,8 @@ class App:
         self.clean_var.set(d["clean_before_extract"])
         self.target_var.set(d["extract_target_dir"])
         self.smart_fix_var.set(d["smart_ext_fix"])
+        self.smart_fix_min_var.set(str(d["smart_fix_min_mb"]).rstrip("0").rstrip(".")
+                                   or "0")
         self.nested_var.set(d["nested_extract"])
         self.ren_mode_var.set(d["rename_mode"])
         self.pre_rule_var.set(d["preprocess_suffix"])
@@ -322,6 +328,10 @@ class App:
         d["clean_before_extract"] = self.clean_var.get()
         d["extract_target_dir"] = self.target_var.get().strip()
         d["smart_ext_fix"] = self.smart_fix_var.get()
+        try:
+            d["smart_fix_min_mb"] = max(0.0, float(self.smart_fix_min_var.get()))
+        except ValueError:
+            pass  # 输入非法时保留原值
         d["nested_extract"] = self.nested_var.get()
         d["rename_mode"] = self.ren_mode_var.get()
         d["preprocess_suffix"] = self.pre_rule_var.get()
