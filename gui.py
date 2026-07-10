@@ -134,6 +134,17 @@ class App:
                                                             expand=True, padx=4)
         ttk.Button(row1, text="浏览...", command=self._browse_7z).pack(side="left")
 
+        # 第 1.2 行：WinRAR/UnRAR 路径（7z 解 rar 失败时的回退引擎）
+        row1a = ttk.Frame(tab)
+        row1a.pack(fill="x", pady=(4, 0))
+        ttk.Label(row1a, text="UnRAR 路径：").pack(side="left")
+        self.winrar_var = tk.StringVar()
+        ttk.Entry(row1a, textvariable=self.winrar_var).pack(side="left", fill="x",
+                                                            expand=True, padx=4)
+        ttk.Button(row1a, text="浏览...", command=self._browse_winrar).pack(side="left")
+        ttk.Label(row1a, text="（7z 解 rar 失败时自动回退，可留空）",
+                  foreground="#888").pack(side="left", padx=4)
+
         # 第 1.5 行：目标解压路径
         row1b = ttk.Frame(tab)
         row1b.pack(fill="x", pady=(4, 0))
@@ -145,24 +156,30 @@ class App:
         ttk.Label(row1b, text="（留空=解压到压缩包所在目录）",
                   foreground="#888").pack(side="left", padx=4)
 
-        # 第二行：开关
+        # 第二行：开关（分两行放置）
         row2 = ttk.Frame(tab)
-        row2.pack(fill="x", pady=4)
+        row2.pack(fill="x", pady=(4, 0))
         self.subfolder_var = tk.BooleanVar()
         ttk.Checkbutton(row2, text="解压到以压缩包名命名的子文件夹",
                         variable=self.subfolder_var).pack(side="left")
         self.delete_var = tk.BooleanVar()
         ttk.Checkbutton(row2, text="解压成功后删除原压缩包（含全部分卷）",
                         variable=self.delete_var).pack(side="left", padx=12)
+        self.skip_existing_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(row2, text="跳过已存在的同名文件夹",
+                        variable=self.skip_existing_var).pack(side="left", padx=12)
+
+        row2b = ttk.Frame(tab)
+        row2b.pack(fill="x", pady=(0, 4))
         self.smart_fix_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row2, text="智能识别伪装扩展名（≥",
-                        variable=self.smart_fix_var).pack(side="left", padx=(12, 0))
+        ttk.Checkbutton(row2b, text="智能识别伪装扩展名（≥",
+                        variable=self.smart_fix_var).pack(side="left")
         self.smart_fix_min_var = tk.StringVar(value="1")
-        ttk.Entry(row2, textvariable=self.smart_fix_min_var,
+        ttk.Entry(row2b, textvariable=self.smart_fix_min_var,
                   width=5, justify="center").pack(side="left")
-        ttk.Label(row2, text="MB 才识别，防存档误判）").pack(side="left")
+        ttk.Label(row2b, text="MB 才识别，防存档误判）").pack(side="left")
         self.nested_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(row2, text="嵌套解压（最多4层）",
+        ttk.Checkbutton(row2b, text="嵌套解压（最多4层）",
                         variable=self.nested_var).pack(side="left", padx=12)
 
         # 第三行：密码池 + 操作按钮
@@ -303,6 +320,8 @@ class App:
         d = self.config.data
         self.root_var.set(d["last_root"])
         self.sz_path_var.set(d["seven_zip_path"])
+        self.winrar_var.set(d["winrar_path"])
+        self.skip_existing_var.set(d["skip_existing_folder"])
         self.csv_var.set(d["last_csv"])
         self.subfolder_var.set(d["extract_to_subfolder"])
         self.delete_var.set(d["delete_after_extract"])
@@ -322,6 +341,8 @@ class App:
         d = self.config.data
         d["last_root"] = self.root_var.get().strip()
         d["seven_zip_path"] = self.sz_path_var.get().strip()
+        d["winrar_path"] = self.winrar_var.get().strip()
+        d["skip_existing_folder"] = self.skip_existing_var.get()
         d["last_csv"] = self.csv_var.get().strip()
         d["extract_to_subfolder"] = self.subfolder_var.get()
         d["delete_after_extract"] = self.delete_var.get()
@@ -355,6 +376,13 @@ class App:
                                           filetypes=[("7z.exe", "7z.exe"), ("所有文件", "*.*")])
         if path:
             self.sz_path_var.set(str(Path(path)))
+
+    def _browse_winrar(self):
+        path = filedialog.askopenfilename(
+            title="选择 UnRAR.exe（WinRAR 安装目录内）",
+            filetypes=[("UnRAR/WinRAR", "*.exe"), ("所有文件", "*.*")])
+        if path:
+            self.winrar_var.set(str(Path(path)))
 
     def _browse_target(self):
         path = filedialog.askdirectory(title="选择目标解压路径")

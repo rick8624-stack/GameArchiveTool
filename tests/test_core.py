@@ -25,7 +25,8 @@ from core import rename as rename_mod
 from core.config import Config
 from core.progress_store import ProgressStore
 from core.report import ReportRecord, export_csv
-from core.sevenzip import SevenZip
+from core.sevenzip import ListResult, SevenZip, SevenZipResult
+from core.unrar import UnRar, detect_unrar
 
 
 def find_7z() -> str | None:
@@ -37,6 +38,10 @@ def find_7z() -> str | None:
 
 
 SEVENZIP = find_7z()
+UNRAR = detect_unrar() if Path(detect_unrar()).is_file() else None
+RAR_EXE = next((p for p in (r"C:\Program Files\WinRAR\Rar.exe",
+                            r"C:\Program Files (x86)\WinRAR\Rar.exe")
+                if Path(p).is_file()), None)
 
 
 class TempDirTestCase(unittest.TestCase):
@@ -515,6 +520,39 @@ class TestExtractFlow(TempDirTestCase):
         # 原目录不产生解压产物（压缩包本身保留）
         self.assertFalse((sub / "游戏数据.txt").exists())
 
+    def test_skip_existing_subfolder(self):
+        """跳过模式：子文件夹模式下，目标同名文件夹已存在且非空 → 跳过。"""
+        d = self.work / "ext"
+        d.mkdir()
+        self.run7z("a", str(d / "游戏S.zip"), str(self.src / "*"))
+        self.cfg.data["extract_to_subfolder"] = True
+        (d / "游戏S").mkdir()
+        (d / "游戏S" / "旧文件.txt").write_text("old", encoding="utf-8")
+
+        rec = list(self.extract_all(d).values())[0]
+        self.assertEqual(rec.result, "跳过")
+        self.assertIn("同名文件夹", rec.detail)
+        # 原有内容未被覆盖
+        self.assertEqual((d / "游戏S" / "旧文件.txt").read_text(encoding="utf-8"), "old")
+
+        # 关闭跳过模式后正常解压
+        self.cfg.data["skip_existing_folder"] = False
+        rec = list(self.extract_all(d).values())[0]
+        self.assertEqual(rec.result, "成功")
+        self.assertTrue((d / "游戏S" / "游戏数据.txt").exists())
+
+    def test_skip_existing_single_top_dir(self):
+        """跳过模式：包内唯一顶层文件夹在目标位置已存在 → 跳过（非子文件夹模式也生效）。"""
+        d = self.work / "ext"
+        d.mkdir()
+        self.run7z("a", str(d / "游戏T.7z"), str(self.src))  # 包内顶层是 "src" 文件夹
+        (d / "src").mkdir()
+        (d / "src" / "已有.txt").write_text("x", encoding="utf-8")
+
+        rec = list(self.extract_all(d).values())[0]
+        self.assertEqual(rec.result, "跳过")
+        self.assertIn("顶层文件夹已存在", rec.detail)
+
     def test_list_archive_password_gate(self):
         """7z l 快速验证：头部加密包错密码立即失败，正确密码返回内容信息。"""
         d = self.work / "ext"
@@ -559,6 +597,78 @@ class TestRename(TempDirTestCase):
         result = rename_mod.execute_plans(scan.plans, self.quiet_log)
         self.assertEqual(result.renamed, 3)
         self.assertTrue((self.work / "分类" / "001.Halo 3").exists())
+
+
+# ================= 模块二：WinRAR 引擎回退（需要 WinRAR） =================
+
+class _Failing7z(SevenZip):
+    """模拟"7z 处理不了这个 rar"的桩：列表与测试永远报密码错误。"""
+
+    def list_archive(self, archive, password=""):
+        return ListResult(False, "ERROR: Wrong password", set(), set(), 0)
+
+    def test(self, archive, password="", progress_cb=None):
+        return SevenZipResult(2, "ERROR: Wrong password")
+
+
+@unittest.skipUnless(UNRAR and RAR_EXE, "未安装 WinRAR，跳过回退引擎测试")
+class TestWinRarFallback(TempDirTestCase):
+    def setUp(self):
+        super().setUp()
+        self.src = self.work / "src"
+        self.src.mkdir()
+        (self.src / "游戏数据.txt").write_text("rar内容", encoding="utf-8")
+
+    def make_rar(self, archive: Path, *extra):
+        # -ep1 排除基准目录，包内只存文件名（不带完整路径）
+        r = subprocess.run([RAR_EXE, "a", "-ep1", *extra, str(archive),
+                            str(self.src / "*")],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_unrar_wrapper(self):
+        """UnRAR 封装：密码测试与解压。"""
+        arc = self.work / "加密.rar"
+        self.make_rar(arc, "-pmypass")
+        ur = UnRar(UNRAR)
+        self.assertFalse(ur.test(arc, "wrong").ok)
+        self.assertTrue(ur.test(arc, "mypass").ok)
+        out = self.work / "out"
+        self.assertTrue(ur.extract(arc, out, "mypass").ok)
+        self.assertEqual((out / "游戏数据.txt").read_text(encoding="utf-8"), "rar内容")
+
+    def test_fallback_when_7z_fails(self):
+        """7z 全部失败（桩模拟）时自动回退 WinRAR 引擎完成解压。"""
+        d = self.work / "ext"
+        d.mkdir()
+        self.make_rar(d / "顽固.rar", "-pstubborn")
+        cfg = Config(self.work / "config.json")
+        cfg.data["winrar_path"] = UNRAR
+        cfg.add_password("stubborn")
+
+        items = extract.find_archives(d)
+        logs = []
+        rec = extract.extract_one(items[0], cfg, _Failing7z("dummy_7z"),
+                                  lambda m, t: logs.append(m))
+        self.assertEqual(rec.result, "成功", rec.detail)
+        self.assertEqual(rec.password, "stubborn")
+        self.assertIn("WinRAR 引擎回退", rec.detail)
+        self.assertTrue((d / "游戏数据.txt").exists())
+        self.assertTrue(any("WinRAR" in m for m in logs))
+        # 命中计数照常累加
+        self.assertEqual(cfg.sorted_passwords()[0]["hits"], 1)
+
+    def test_no_fallback_for_non_rar(self):
+        """非 rar 文件不走 WinRAR 回退，仍按 7z 的结论报失败。"""
+        d = self.work / "ext"
+        d.mkdir()
+        (d / "损坏.zip").write_bytes(b"PK\x03\x04broken")
+        cfg = Config(self.work / "config.json")
+        cfg.data["winrar_path"] = UNRAR
+        items = extract.find_archives(d)
+        rec = extract.extract_one(items[0], cfg, _Failing7z("dummy_7z"),
+                                  self.quiet_log)
+        self.assertEqual(rec.result, "失败")
 
 
 class TestRenameDefaultAndUndo(TempDirTestCase):

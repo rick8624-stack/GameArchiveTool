@@ -17,7 +17,11 @@ from typing import Callable, Optional
 
 from core.config import Config
 from core.sevenzip import ListResult, SevenZip
+from core.unrar import UnRar
 from utils import is_path_too_long
+
+# rar 系文件名（含 .rar.001 数字分卷），7z 失败时可尝试 WinRAR 引擎回退
+_RAR_NAME_RE = re.compile(r"(?i)\.rar(\.\d{3})?$")
 
 # 可选依赖：装了 send2trash 则"删除原压缩包"进回收站（可恢复），
 # 没装则回退为永久删除
@@ -281,11 +285,22 @@ def extract_one(
     """
     archive = item.main_file
     start = time.time()
+    base = dest_parent if dest_parent is not None else archive.parent
+    skip_existing = config.data.get("skip_existing_folder", True)
 
     # 边界：路径过长直接跳过
     if is_path_too_long(archive):
         log(f"[跳过] 路径超过 Windows 260 字符限制：{archive}", "warn")
         return ExtractRecord(str(archive), "跳过", "路径过长", elapsed=time.time() - start)
+
+    # 跳过模式（一）：子文件夹模式下，目标同名文件夹已存在且非空 → 视为已解压过。
+    # 在密码尝试之前检查，省掉整个测试开销
+    if skip_existing and config.data["extract_to_subfolder"]:
+        tgt = base / item.stem
+        if tgt.is_dir() and any(tgt.iterdir()):
+            log(f"[跳过] 同名文件夹已存在：{tgt}", "warn")
+            return ExtractRecord(str(archive), "跳过", "同名文件夹已存在（跳过模式）",
+                                 elapsed=time.time() - start)
 
     # 密码尝试顺序：无密码 → 批次内最近命中 → 密码池按命中次数降序（去重）
     candidates = [""]
@@ -313,6 +328,14 @@ def extract_one(
                 break
             log(f"    {label} 快速验证未通过", "info")
             continue
+        # 跳过模式（二）：包内唯一顶层文件夹在目标位置已存在且非空 → 视为已解压过
+        if skip_existing and lr.single_top_dir:
+            tgt = base / lr.single_top_dir
+            if tgt.is_dir() and any(tgt.iterdir()):
+                log(f"[跳过] 包内顶层文件夹已存在于目标位置：{tgt}", "warn")
+                return ExtractRecord(str(archive), "跳过",
+                                     "包内顶层文件夹已存在（跳过模式）",
+                                     elapsed=time.time() - start)
         # 第二道闸：7z t 完整校验数据（非头部加密的包 l 会误通过）
         log(f"    测试 {label} ...", "info")
         result = sz.test(archive, pwd, progress_cb=file_progress)
@@ -329,13 +352,29 @@ def extract_one(
             log(f"    测试失败：{reason}", "warn")
             break
 
+    # WinRAR 引擎回退：7z 全部尝试失败且目标是 rar 系文件时，用 UnRAR 重试密码池。
+    # 部分 WinRAR 新版本生成的加密 rar，7z 的实现无法解压但 UnRAR 可以
+    unrar_engine: Optional[UnRar] = None
+    if hit_password is None and _RAR_NAME_RE.search(archive.name):
+        unrar = UnRar(config.data.get("winrar_path", ""))
+        if unrar.available():
+            log("    7z 全部尝试失败，改用 WinRAR 引擎（UnRAR）重试...", "warn")
+            for pwd in candidates:
+                label = "无密码" if pwd == "" else f"密码「{pwd}」"
+                log(f"    [WinRAR] 测试 {label} ...", "info")
+                result = unrar.test(archive, pwd, progress_cb=file_progress)
+                if result.ok:
+                    hit_password = pwd
+                    unrar_engine = unrar
+                    log(f"    [WinRAR] {label} 验证通过", "info")
+                    break
+
     if hit_password is None:
         reason = SevenZip.classify_failure(last_output, archive)
         log(f"[失败] {archive.name}：{reason}", "error")
         return ExtractRecord(str(archive), "失败", reason, elapsed=time.time() - start)
 
     # 确定解压目标目录；包内已有唯一顶层文件夹时不再套子文件夹（避免 游戏A/游戏A/ 双重嵌套）
-    base = dest_parent if dest_parent is not None else archive.parent
     use_subfolder = config.data["extract_to_subfolder"]
     if use_subfolder and listing and listing.single_top_dir:
         log(f"    包内已有唯一顶层文件夹「{listing.single_top_dir}」，"
@@ -361,10 +400,14 @@ def extract_one(
     if out_dir.exists() and any(out_dir.iterdir()):
         log(f"    注意：目标目录已有文件，重名文件将被 -y 覆盖：{out_dir}", "warn")
 
-    # 真正解压
+    # 真正解压（WinRAR 回退时用同一引擎，避免 7z 再次失败）
     if file_progress:
         file_progress(0)
-    result = sz.extract(archive, out_dir, hit_password, progress_cb=file_progress)
+    if unrar_engine is not None:
+        result = unrar_engine.extract(archive, out_dir, hit_password,
+                                      progress_cb=file_progress)
+    else:
+        result = sz.extract(archive, out_dir, hit_password, progress_cb=file_progress)
     if not result.ok:
         reason = SevenZip.classify_failure(result.output, archive)
         log(f"[失败] {archive.name}：解压阶段出错（{reason}）", "error")
@@ -398,8 +441,13 @@ def extract_one(
 
     elapsed = time.time() - start
     pwd_note = f"（密码：{hit_password}）" if hit_password else "（无密码）"
-    log(f"[成功] {archive.name} → {out_dir} {pwd_note}，耗时 {elapsed:.1f}s{deleted_note}", "success")
-    return ExtractRecord(str(archive), "成功", deleted_note.lstrip("；"),
+    engine_note = "［WinRAR 引擎］" if unrar_engine is not None else ""
+    detail = deleted_note.lstrip("；")
+    if unrar_engine is not None:
+        detail = f"WinRAR 引擎回退；{detail}".rstrip("；")
+    log(f"[成功] {archive.name} → {out_dir} {pwd_note}{engine_note}，"
+        f"耗时 {elapsed:.1f}s{deleted_note}", "success")
+    return ExtractRecord(str(archive), "成功", detail,
                          password=hit_password, elapsed=elapsed, out_dir=str(out_dir))
 
 

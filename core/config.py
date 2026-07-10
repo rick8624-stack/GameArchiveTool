@@ -12,6 +12,7 @@ CONFIG_FILE = "config.json"
 # 默认配置。密码池条目格式：{"password": "xxx", "hits": 0}
 DEFAULTS = {
     "seven_zip_path": r"C:\Program Files\7-Zip\7z.exe",
+    "winrar_path": r"C:\Program Files\WinRAR\UnRAR.exe",  # 7z 解 rar 失败时的回退引擎
     "passwords": [],
     "last_root": "",
     "last_csv": "",
@@ -19,6 +20,7 @@ DEFAULTS = {
     "delete_to_recycle": True,         # 删除原压缩包时进回收站（需 send2trash，否则永久删除）
     "extract_to_subfolder": False,     # 解压到以压缩包名命名的子文件夹
     "extract_target_dir": "",          # 目标解压路径（留空=解压到压缩包所在目录）
+    "skip_existing_folder": True,      # 跳过模式：目标位置已有同名文件夹时跳过该压缩包
     "clean_before_extract": True,      # 批量解压前自动执行文件名清理
     "smart_ext_fix": True,             # 智能识别伪装扩展名（按文件头魔数修正）
     "smart_fix_min_mb": 1.0,           # 小于此大小(MB)的文件不做伪装识别（防游戏存档误判）

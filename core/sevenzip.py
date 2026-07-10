@@ -14,6 +14,55 @@ CREATE_NO_WINDOW = 0x08000000 if sys.platform == "win32" else 0
 _PERCENT_RE = re.compile(r"(\d{1,3})%")
 
 
+def run_streaming(cmd, progress_cb=None) -> "SevenZipResult":
+    """执行外部解压引擎（7z / UnRAR 通用）并逐字符解析实时百分比。
+
+    关键点：
+    - stdin=DEVNULL：防止子进程遇到需要密码/确认时交互等待导致挂死
+    - 进度用 \b/\r 原地刷新，不能按行读，需按字符读并把退格/回车视作换行
+    """
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            encoding="utf-8",
+            errors="replace",
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except OSError as e:
+        return SevenZipResult(-1, f"无法启动 {cmd[0]}：{e}")
+
+    lines: list[str] = []
+    buf = ""
+    while True:
+        ch = proc.stdout.read(1)
+        if ch == "":
+            break
+        if ch in ("\b", "\r"):
+            ch = "\n"
+        if ch == "\n":
+            line = buf.strip()
+            buf = ""
+            if not line:
+                continue
+            m = _PERCENT_RE.search(line)
+            if m and progress_cb:
+                progress_cb(min(100, int(m.group(1))))
+            lines.append(line)
+            # 防止超大压缩包的海量进度行占用内存，只保留头尾
+            if len(lines) > 400:
+                lines = lines[:100] + lines[-200:]
+        else:
+            buf += ch
+    if buf.strip():
+        lines.append(buf.strip())
+    proc.stdout.close()
+    proc.wait()
+    return SevenZipResult(proc.returncode, "\n".join(lines))
+
+
 class SevenZipResult:
     """一次 7z 调用的结果。"""
 
@@ -61,54 +110,8 @@ class SevenZip:
         args: list[str],
         progress_cb: Optional[Callable[[int], None]] = None,
     ) -> SevenZipResult:
-        """执行 7z 并逐字符读取输出流以解析实时百分比。
-
-        关键点：
-        - stdin=DEVNULL：防止 7z 遇到需要密码/确认时交互等待导致挂死
-        - -sccUTF-8：强制 7z 控制台输出用 UTF-8，保证中文文件名不乱码
-        - 7z 的 -bsp1 进度用 \b/\r 原地刷新，不能按行读，需按字符读并把
-          退格/回车视作换行来切分
-        """
-        cmd = [self.exe_path] + args + ["-sccUTF-8"]
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                encoding="utf-8",
-                errors="replace",
-                creationflags=CREATE_NO_WINDOW,
-            )
-        except OSError as e:
-            return SevenZipResult(-1, f"无法启动 7z.exe：{e}")
-
-        lines: list[str] = []
-        buf = ""
-        while True:
-            ch = proc.stdout.read(1)
-            if ch == "":
-                break
-            if ch in ("\b", "\r"):
-                ch = "\n"
-            if ch == "\n":
-                line = buf.strip()
-                buf = ""
-                if not line:
-                    continue
-                m = _PERCENT_RE.search(line)
-                if m and progress_cb:
-                    progress_cb(min(100, int(m.group(1))))
-                lines.append(line)
-                # 防止超大压缩包的海量进度行占用内存，只保留头尾
-                if len(lines) > 400:
-                    lines = lines[:100] + lines[-200:]
-            else:
-                buf += ch
-        if buf.strip():
-            lines.append(buf.strip())
-        proc.wait()
-        return SevenZipResult(proc.returncode, "\n".join(lines))
+        """执行 7z（-sccUTF-8 强制 UTF-8 控制台输出，保证中文文件名不乱码）。"""
+        return run_streaming([self.exe_path] + args + ["-sccUTF-8"], progress_cb)
 
     # ---------- 对外操作 ----------
 
