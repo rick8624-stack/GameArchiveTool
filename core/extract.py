@@ -20,9 +20,6 @@ from core.sevenzip import ListResult, SevenZip
 from core.unrar import UnRar
 from utils import is_path_too_long
 
-# rar 系文件名（含 .rar.001 数字分卷），7z 失败时可尝试 WinRAR 引擎回退
-_RAR_NAME_RE = re.compile(r"(?i)\.rar(\.\d{3})?$")
-
 # 可选依赖：装了 send2trash 则"删除原压缩包"进回收站（可恢复），
 # 没装则回退为永久删除
 try:
@@ -468,16 +465,13 @@ def _try_unrar_fallback(
 ) -> tuple[Optional[UnRar], str]:
     """尝试 WinRAR 引擎回退：逐个候选密码用 UnRAR 验证。
 
-    触发条件（UnRAR 可用时）：文件名是 rar 系，**或**首卷内容经魔数
-    嗅探为 RAR 格式。后者用于处理「把 rar 改名成 .7z/.zip/.001」的伪装包——
-    7z 能读出文件名却解不了数据，而 UnRAR 按内容识别照样能解。
-    返回 (引擎, 命中密码)，不适用或全部失败返回 (None, "")。"""
-    is_rar = bool(_RAR_NAME_RE.search(archive.name)) or \
-        sniff_archive_format(archive) == "rar"
-    if not is_rar:
-        return None, ""
+    只要 UnRAR 可用就无条件尝试——不再靠扩展名或魔数判断格式。原因：
+    伪装包（rar 改名成 .7z/.zip/.001）7z 能读文件名却解不了数据，靠名字/
+    魔数判断都可能漏掉；UnRAR 按内容识别，遇到真正非 rar 的内容会自行失败，
+    无害。返回 (引擎, 命中密码)，UnRAR 不可用或全部失败返回 (None, "")。"""
     unrar = UnRar(config.data.get("winrar_path", ""))
     if not unrar.available():
+        log("    未配置可用的 UnRAR，无法回退（请在详细设置中指定 UnRAR 路径）", "warn")
         return None, ""
     log(f"    {reason}，改用 WinRAR 引擎（UnRAR）重试...", "warn")
     for pwd in candidates:
