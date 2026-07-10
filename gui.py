@@ -81,6 +81,7 @@ class App:
         self.subfolder_var = tk.BooleanVar()
         self.delete_var = tk.BooleanVar()
         self.skip_existing_var = tk.BooleanVar(value=True)
+        self.force_extract_var = tk.BooleanVar(value=False)
         self.clean_var = tk.BooleanVar(value=True)
         self.smart_fix_var = tk.BooleanVar(value=True)
         self.smart_fix_min_var = tk.StringVar(value="1")
@@ -257,6 +258,11 @@ class App:
         ttk.Label(r2, text="MB 才识别，防存档误判）").pack(side="left")
         ttk.Checkbutton(r2, text="嵌套解压（最多4层）",
                         variable=self.nested_var).pack(side="left", padx=12)
+        r3 = ttk.Frame(opt)
+        r3.pack(fill="x", pady=(4, 0))
+        ttk.Checkbutton(
+            r3, text="强制解压（分卷缺失/损坏时仍强制解压，结果可能不完整、不回退）",
+            variable=self.force_extract_var).pack(side="left")
 
         # ---- 文件名清理 ----
         clean = ttk.LabelFrame(win, text="文件名清理（一键解压前自动执行）", padding=6)
@@ -323,6 +329,7 @@ class App:
         self.subfolder_var.set(d["extract_to_subfolder"])
         self.delete_var.set(d["delete_after_extract"])
         self.skip_existing_var.set(d["skip_existing_folder"])
+        self.force_extract_var.set(d["force_extract"])
         self.clean_var.set(d["clean_before_extract"])
         self.smart_fix_var.set(d["smart_ext_fix"])
         self.smart_fix_min_var.set(str(d["smart_fix_min_mb"]).rstrip("0").rstrip(".")
@@ -343,6 +350,7 @@ class App:
         d["extract_to_subfolder"] = self.subfolder_var.get()
         d["delete_after_extract"] = self.delete_var.get()
         d["skip_existing_folder"] = self.skip_existing_var.get()
+        d["force_extract"] = self.force_extract_var.get()
         d["clean_before_extract"] = self.clean_var.get()
         d["smart_ext_fix"] = self.smart_fix_var.get()
         try:

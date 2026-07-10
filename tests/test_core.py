@@ -832,6 +832,68 @@ class TestWinRarFallback(TempDirTestCase):
         self.assertEqual(rec.result, "失败")
 
 
+class _MissingVolume7z(SevenZip):
+    """模拟分卷缺失：文件头可读（list 通过），但 test / extract 因缺后续卷失败。
+
+    extract 仍会写出部分已解出的内容（模拟 7z 遇到 missing volume 时先解已
+    有卷再报错），用于验证强制解压保留部分结果。
+    """
+
+    def list_archive(self, archive, password=""):
+        return ListResult(True, "", set(), set(), 0)
+
+    def test(self, archive, password="", progress_cb=None):
+        return SevenZipResult(2, "ERROR: Missing volume : game.002")
+
+    def extract(self, archive, out_dir, password="", progress_cb=None):
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        (Path(out_dir) / "部分文件.bin").write_bytes(b"partial")
+        return SevenZipResult(2, "ERROR: Missing volume : game.002")
+
+
+class TestForceExtract(TempDirTestCase):
+    def _make_item(self):
+        d = self.work / "ext"
+        d.mkdir()
+        arc = d / "游戏.7z"
+        arc.write_bytes(b"7z\xbc\xaf\x27\x1c" + b"\x00" * 64)
+        return extract.find_archives(d)[0], d
+
+    def test_missing_volume_fails_without_force(self):
+        """默认（不强制）：分卷缺失导致校验失败 → 记为失败，不保留部分结果。"""
+        item, d = self._make_item()
+        cfg = Config(self.work / "config.json")
+        cfg.data["winrar_path"] = ""  # 无回退引擎，纯看 7z 结论
+        rec = extract.extract_one(item, cfg, _MissingVolume7z("dummy_7z"),
+                                  self.quiet_log)
+        self.assertEqual(rec.result, "失败")
+
+    def test_missing_volume_forced(self):
+        """开启强制解压：校验失败仍强制解压，保留部分结果并记为成功。"""
+        item, d = self._make_item()
+        cfg = Config(self.work / "config.json")
+        cfg.data["force_extract"] = True
+        logs = []
+        rec = extract.extract_one(item, cfg, _MissingVolume7z("dummy_7z"),
+                                  lambda m, t: logs.append(m))
+        self.assertEqual(rec.result, "成功", rec.detail)
+        self.assertIn("强制解压", rec.detail)
+        self.assertTrue((d / "部分文件.bin").exists())
+        self.assertTrue(any("强制" in m for m in logs))
+
+    def test_force_does_not_fallback_unrar(self):
+        """强制模式按用户要求不回退 UnRAR：即使配置了 UnRAR 也不调用它。"""
+        item, d = self._make_item()
+        cfg = Config(self.work / "config.json")
+        cfg.data["force_extract"] = True
+        cfg.data["winrar_path"] = r"C:\Program Files\WinRAR\UnRAR.exe"
+        logs = []
+        rec = extract.extract_one(item, cfg, _MissingVolume7z("dummy_7z"),
+                                  lambda m, t: logs.append(m))
+        self.assertEqual(rec.result, "成功", rec.detail)
+        self.assertFalse(any("WinRAR" in m or "UnRAR" in m for m in logs))
+
+
 class TestRenameDefaultAndUndo(TempDirTestCase):
     def test_default_numbering(self):
         """默认编号模式：一级子文件夹按名称排序改为 1, 2, 3..."""
