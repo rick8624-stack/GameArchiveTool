@@ -611,6 +611,19 @@ class _Failing7z(SevenZip):
         return SevenZipResult(2, "ERROR: Wrong password")
 
 
+class _ExtractPhaseFailing7z(SevenZip):
+    """模拟"7z 测试通过但解压阶段因格式问题失败"的桩。"""
+
+    def list_archive(self, archive, password=""):
+        return ListResult(True, "", set(), set(), 0)
+
+    def test(self, archive, password="", progress_cb=None):
+        return SevenZipResult(0, "Everything is Ok")
+
+    def extract(self, archive, out_dir, password="", progress_cb=None):
+        return SevenZipResult(2, "ERROR: Unsupported method")
+
+
 @unittest.skipUnless(UNRAR and RAR_EXE, "未安装 WinRAR，跳过回退引擎测试")
 class TestWinRarFallback(TempDirTestCase):
     def setUp(self):
@@ -657,6 +670,28 @@ class TestWinRarFallback(TempDirTestCase):
         self.assertTrue(any("WinRAR" in m for m in logs))
         # 命中计数照常累加
         self.assertEqual(cfg.sorted_passwords()[0]["hits"], 1)
+
+    def test_fallback_when_7z_extract_phase_fails(self):
+        """bug 修复：7z 测试通过但解压阶段失败（格式问题）时也要回退 WinRAR。
+
+        此前该路径直接报失败——因为 7z 的 t 测试误通过（比如报成密码
+        问题之外的格式错误），回退逻辑根本没机会触发。"""
+        d = self.work / "ext"
+        d.mkdir()
+        self.make_rar(d / "格式问题.rar", "-pstubborn")
+        cfg = Config(self.work / "config.json")
+        cfg.data["winrar_path"] = UNRAR
+        cfg.add_password("stubborn")
+
+        items = extract.find_archives(d)
+        logs = []
+        rec = extract.extract_one(items[0], cfg, _ExtractPhaseFailing7z("dummy_7z"),
+                                  lambda m, t: logs.append(m))
+        self.assertEqual(rec.result, "成功", rec.detail)
+        self.assertEqual(rec.password, "stubborn")
+        self.assertIn("WinRAR 引擎回退", rec.detail)
+        self.assertTrue((d / "游戏数据.txt").exists())
+        self.assertTrue(any("解压阶段失败" in m for m in logs))
 
     def test_no_fallback_for_non_rar(self):
         """非 rar 文件不走 WinRAR 回退，仍按 7z 的结论报失败。"""

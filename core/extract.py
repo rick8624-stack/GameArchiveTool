@@ -352,22 +352,15 @@ def extract_one(
             log(f"    测试失败：{reason}", "warn")
             break
 
-    # WinRAR 引擎回退：7z 全部尝试失败且目标是 rar 系文件时，用 UnRAR 重试密码池。
-    # 部分 WinRAR 新版本生成的加密 rar，7z 的实现无法解压但 UnRAR 可以
+    # WinRAR 引擎回退（一）：7z 密码测试全部失败且目标是 rar 系文件时，
+    # 用 UnRAR 重试密码池。部分 WinRAR 新版本生成的加密 rar，7z 无法解压但 UnRAR 可以
     unrar_engine: Optional[UnRar] = None
-    if hit_password is None and _RAR_NAME_RE.search(archive.name):
-        unrar = UnRar(config.data.get("winrar_path", ""))
-        if unrar.available():
-            log("    7z 全部尝试失败，改用 WinRAR 引擎（UnRAR）重试...", "warn")
-            for pwd in candidates:
-                label = "无密码" if pwd == "" else f"密码「{pwd}」"
-                log(f"    [WinRAR] 测试 {label} ...", "info")
-                result = unrar.test(archive, pwd, progress_cb=file_progress)
-                if result.ok:
-                    hit_password = pwd
-                    unrar_engine = unrar
-                    log(f"    [WinRAR] {label} 验证通过", "info")
-                    break
+    if hit_password is None:
+        unrar_engine, fb_pwd = _try_unrar_fallback(
+            archive, config, candidates, log, file_progress,
+            reason="7z 全部密码尝试失败")
+        if unrar_engine is not None:
+            hit_password = fb_pwd
 
     if hit_password is None:
         reason = SevenZip.classify_failure(last_output, archive)
@@ -408,6 +401,20 @@ def extract_one(
                                       progress_cb=file_progress)
     else:
         result = sz.extract(archive, out_dir, hit_password, progress_cb=file_progress)
+
+    # WinRAR 引擎回退（二）：7z 测试通过但解压阶段因格式问题失败时，
+    # 同样要给 UnRAR 机会——命中的密码优先，其余候选兜底
+    if not result.ok and unrar_engine is None:
+        ordered = [hit_password] + [c for c in candidates if c != hit_password]
+        fb_engine, fb_pwd = _try_unrar_fallback(
+            archive, config, ordered, log, file_progress,
+            reason="7z 解压阶段失败")
+        if fb_engine is not None:
+            unrar_engine = fb_engine
+            hit_password = fb_pwd
+            result = fb_engine.extract(archive, out_dir, hit_password,
+                                       progress_cb=file_progress)
+
     if not result.ok:
         reason = SevenZip.classify_failure(result.output, archive)
         log(f"[失败] {archive.name}：解压阶段出错（{reason}）", "error")
@@ -449,6 +456,34 @@ def extract_one(
         f"耗时 {elapsed:.1f}s{deleted_note}", "success")
     return ExtractRecord(str(archive), "成功", detail,
                          password=hit_password, elapsed=elapsed, out_dir=str(out_dir))
+
+
+def _try_unrar_fallback(
+    archive: Path,
+    config: Config,
+    candidates: list[str],
+    log: Callable[[str, str], None],
+    file_progress: Optional[Callable[[int], None]],
+    reason: str,
+) -> tuple[Optional[UnRar], str]:
+    """尝试 WinRAR 引擎回退：逐个候选密码用 UnRAR 验证。
+
+    仅对 rar 系文件且 UnRAR 可用时生效。返回 (引擎, 命中密码)，
+    不适用或全部失败返回 (None, "")。"""
+    if not _RAR_NAME_RE.search(archive.name):
+        return None, ""
+    unrar = UnRar(config.data.get("winrar_path", ""))
+    if not unrar.available():
+        return None, ""
+    log(f"    {reason}，改用 WinRAR 引擎（UnRAR）重试...", "warn")
+    for pwd in candidates:
+        label = "无密码" if pwd == "" else f"密码「{pwd}」"
+        log(f"    [WinRAR] 测试 {label} ...", "info")
+        if unrar.test(archive, pwd, progress_cb=file_progress).ok:
+            log(f"    [WinRAR] {label} 验证通过", "info")
+            return unrar, pwd
+    log("    [WinRAR] 全部候选密码也未通过", "warn")
+    return None, ""
 
 
 def _free_space(path: Path) -> Optional[int]:
