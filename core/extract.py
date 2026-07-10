@@ -401,9 +401,16 @@ def extract_one(
         if entry["password"] not in candidates:
             candidates.append(entry["password"])
 
+    # 强制解压：校验因分卷缺失/损坏失败时仍强制解压，不提前终止、不回退 UnRAR
+    force = config.data.get("force_extract", False)
+
     hit_password: Optional[str] = None
     listing: Optional[ListResult] = None
     last_output = ""
+    # 强制解压兜底：记录首个通过 7z l 快速检查的密码（即使后续 t 校验失败）。
+    # 分卷缺失时，正确密码也会在 t 阶段报错，靠它保住能用的密码
+    list_ok_pwd: Optional[str] = None
+    list_ok_listing: Optional[ListResult] = None
 
     for pwd in candidates:
         label = "无密码" if pwd == "" else f"密码「{pwd}」"
@@ -415,9 +422,14 @@ def extract_one(
             reason = SevenZip.classify_failure(lr.output, archive)
             if "分卷" in reason or "无法识别" in reason:
                 log(f"    快速检查失败：{reason}", "warn")
-                break
+                if not force:
+                    break
+                continue  # 强制模式：不因分卷不完整/无法识别提前终止
             log(f"    {label} 快速验证未通过", "info")
             continue
+        # 记录首个通过 list 的密码，供强制解压在 t 校验失败时兜底
+        if list_ok_pwd is None:
+            list_ok_pwd, list_ok_listing = pwd, lr
         # 跳过模式（二）：包内唯一顶层文件夹在目标位置已存在且非空 → 视为已解压过
         if skip_existing and lr.single_top_dir:
             tgt = base / lr.single_top_dir
@@ -440,17 +452,27 @@ def extract_one(
         reason = SevenZip.classify_failure(result.output, archive)
         if "分卷" in reason or "无法识别" in reason:
             log(f"    测试失败：{reason}", "warn")
-            break
+            if not force:
+                break
+            continue  # 强制模式：分卷不完整仍继续，已通过 list 的密码即可强制解压
 
     # WinRAR 引擎回退（一）：7z 密码测试全部失败且目标是 rar 系文件时，
-    # 用 UnRAR 重试密码池。部分 WinRAR 新版本生成的加密 rar，7z 无法解压但 UnRAR 可以
+    # 用 UnRAR 重试密码池。部分 WinRAR 新版本生成的加密 rar，7z 无法解压但 UnRAR 可以。
+    # 强制解压模式下按用户要求「不回退」，直接进入强制解压兜底
     unrar_engine: Optional[UnRar] = None
-    if hit_password is None:
+    if hit_password is None and not force:
         unrar_engine, fb_pwd = _try_unrar_fallback(
             archive, config, candidates, log, file_progress,
             reason="7z 全部密码尝试失败")
         if unrar_engine is not None:
             hit_password = fb_pwd
+
+    # 强制解压兜底：校验没通过但有能读取文件头的密码，就用它强制解压
+    if hit_password is None and force and list_ok_pwd is not None:
+        hit_password = list_ok_pwd
+        listing = list_ok_listing
+        lbl = "无密码" if hit_password == "" else f"密码「{hit_password}」"
+        log(f"    [强制解压] 校验未通过，仍用 {lbl} 强制解压（结果可能不完整）", "warn")
 
     if hit_password is None:
         reason = SevenZip.classify_failure(last_output, archive)
@@ -493,8 +515,9 @@ def extract_one(
         result = sz.extract(archive, out_dir, hit_password, progress_cb=file_progress)
 
     # WinRAR 引擎回退（二）：7z 测试通过但解压阶段因格式问题失败时，
-    # 同样要给 UnRAR 机会——命中的密码优先，其余候选兜底
-    if not result.ok and unrar_engine is None:
+    # 同样要给 UnRAR 机会——命中的密码优先，其余候选兜底。
+    # 强制解压模式下按用户要求「不回退」，直接接受部分解压结果
+    if not result.ok and unrar_engine is None and not force:
         ordered = [hit_password] + [c for c in candidates if c != hit_password]
         fb_engine, fb_pwd = _try_unrar_fallback(
             archive, config, ordered, log, file_progress,
@@ -507,6 +530,16 @@ def extract_one(
 
     if not result.ok:
         reason = SevenZip.classify_failure(result.output, archive)
+        if force:
+            # 强制解压：分卷缺失/损坏导致解压出错，仍保留已解出的部分并记为成功
+            elapsed = time.time() - start
+            pwd_note = f"（密码：{hit_password}）" if hit_password else "（无密码）"
+            log(f"[强制完成] {archive.name} → {out_dir} {pwd_note}：解压出错"
+                f"（{reason}），已强制保留部分结果", "warn")
+            return ExtractRecord(str(archive), "成功",
+                                 f"强制解压（可能不完整）：{reason}",
+                                 password=hit_password, elapsed=elapsed,
+                                 out_dir=str(out_dir))
         log(f"[失败] {archive.name}：解压阶段出错（{reason}）", "error")
         return ExtractRecord(str(archive), "失败", f"解压阶段：{reason}",
                              password=hit_password, elapsed=time.time() - start)
