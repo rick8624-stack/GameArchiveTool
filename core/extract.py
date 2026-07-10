@@ -468,9 +468,13 @@ def _try_unrar_fallback(
 ) -> tuple[Optional[UnRar], str]:
     """尝试 WinRAR 引擎回退：逐个候选密码用 UnRAR 验证。
 
-    仅对 rar 系文件且 UnRAR 可用时生效。返回 (引擎, 命中密码)，
-    不适用或全部失败返回 (None, "")。"""
-    if not _RAR_NAME_RE.search(archive.name):
+    触发条件（UnRAR 可用时）：文件名是 rar 系，**或**首卷内容经魔数
+    嗅探为 RAR 格式。后者用于处理「把 rar 改名成 .7z/.zip/.001」的伪装包——
+    7z 能读出文件名却解不了数据，而 UnRAR 按内容识别照样能解。
+    返回 (引擎, 命中密码)，不适用或全部失败返回 (None, "")。"""
+    is_rar = bool(_RAR_NAME_RE.search(archive.name)) or \
+        sniff_archive_format(archive) == "rar"
+    if not is_rar:
         return None, ""
     unrar = UnRar(config.data.get("winrar_path", ""))
     if not unrar.available():

@@ -741,6 +741,32 @@ class TestWinRarFallback(TempDirTestCase):
         self.assertTrue((d / "游戏数据.txt").exists())
         self.assertTrue(any("解压阶段失败" in m for m in logs))
 
+    def test_fallback_for_rar_disguised_as_7z(self):
+        """bug 修复：内容是 rar 但名字是 .7z 时也要回退 UnRAR。
+
+        这类伪装包（rar 改名成 .7z/.001）7z 能列文件名却解不了数据，
+        此前回退按扩展名判定，.7z 名字直接不触发回退。现改为按内容魔数判定。"""
+        d = self.work / "ext"
+        d.mkdir()
+        # 造一个真 rar，再改名成 .7z（内容仍是 RAR 魔数）
+        self.make_rar(d / "_tmp.rar", "-pdisguise")
+        disguised = d / "伪装.7z"
+        (d / "_tmp.rar").rename(disguised)
+
+        cfg = Config(self.work / "config.json")
+        cfg.data["winrar_path"] = UNRAR
+        cfg.add_password("disguise")
+
+        items = extract.find_archives(d)
+        self.assertEqual(items[0].main_file.name, "伪装.7z")  # 被当成 7z 单文件
+        logs = []
+        rec = extract.extract_one(items[0], cfg, _Failing7z("dummy_7z"),
+                                  lambda m, t: logs.append(m))
+        self.assertEqual(rec.result, "成功", rec.detail)
+        self.assertEqual(rec.password, "disguise")
+        self.assertIn("WinRAR 引擎回退", rec.detail)
+        self.assertTrue((d / "游戏数据.txt").exists())
+
     def test_no_fallback_for_non_rar(self):
         """非 rar 文件不走 WinRAR 回退，仍按 7z 的结论报失败。"""
         d = self.work / "ext"
