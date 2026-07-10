@@ -304,6 +304,44 @@ class TestSniffDisguise(TempDirTestCase):
         names = sorted(p.name for p in self.work.iterdir())
         self.assertEqual(names, ["存档.sav", "资源.pak", "进度.save"])
 
+    def test_volume_first_part_not_renamed_sfx(self):
+        """SFX 分卷：首卷 game.exe（带压缩头）+ game.001/.002，首卷不得被追加扩展名。"""
+        d = self.work
+        (d / "game.exe").write_bytes(b"7z\xbc\xaf\x27\x1c" + b"x" * 4096)  # 7z 魔数
+        (d / "game.001").write_bytes(b"rawdata" * 1000)
+        (d / "game.002").write_bytes(b"rawdata" * 1000)
+        fixed = extract.fix_disguised_extensions(d, self.quiet_log, min_size=0)
+        self.assertEqual(fixed, [])
+        self.assertTrue((d / "game.exe").exists())  # 未被改成 game.exe.7z
+
+    def test_numeric_suffix_first_volume_not_renamed(self):
+        """两位数分卷 game.01（带 7z 魔数）+ game.02：首卷不得被追加扩展名。"""
+        d = self.work
+        (d / "game.01").write_bytes(b"7z\xbc\xaf\x27\x1c" + b"x" * 4096)
+        (d / "game.02").write_bytes(b"rawdata" * 1000)
+        fixed = extract.fix_disguised_extensions(d, self.quiet_log, min_size=0)
+        self.assertEqual(fixed, [])
+        self.assertTrue((d / "game.01").exists())
+
+    def test_restore_appended_volume_ext(self):
+        """分卷修复：已被误改的 game.001.7z 在存在 game.002 时还原为 game.001。"""
+        d = self.work
+        (d / "game.001.7z").write_bytes(b"7z\xbc\xaf\x27\x1c" + b"x" * 100)
+        (d / "game.002").write_bytes(b"rawdata")
+        (d / "game.003").write_bytes(b"rawdata")
+        restored = extract.restore_appended_volume_ext(d, self.quiet_log)
+        self.assertEqual(len(restored), 1)
+        self.assertTrue((d / "game.001").exists())
+        self.assertFalse((d / "game.001.7z").exists())
+
+    def test_restore_skips_genuine_single_archive(self):
+        """不误伤：movie.2020.7z 没有分卷兄弟 → 保持原样。"""
+        d = self.work
+        (d / "movie.2020.7z").write_bytes(b"7z\xbc\xaf\x27\x1c")
+        restored = extract.restore_appended_volume_ext(d, self.quiet_log)
+        self.assertEqual(restored, [])
+        self.assertTrue((d / "movie.2020.7z").exists())
+
     def test_min_size_gate(self):
         """大小门槛：小于阈值的伪装文件不识别（1KB-100KB 的存档类小文件）。"""
         import zipfile
@@ -767,13 +805,27 @@ class TestWinRarFallback(TempDirTestCase):
         self.assertIn("WinRAR 引擎回退", rec.detail)
         self.assertTrue((d / "游戏数据.txt").exists())
 
-    def test_no_fallback_for_non_rar(self):
-        """非 rar 文件不走 WinRAR 回退，仍按 7z 的结论报失败。"""
+    def test_fallback_attempted_but_fails_for_non_rar(self):
+        """非 rar 内容：强制回退 UnRAR 也会尝试，但 UnRAR 解不了 → 仍报失败。"""
         d = self.work / "ext"
         d.mkdir()
         (d / "损坏.zip").write_bytes(b"PK\x03\x04broken")
         cfg = Config(self.work / "config.json")
         cfg.data["winrar_path"] = UNRAR
+        items = extract.find_archives(d)
+        logs = []
+        rec = extract.extract_one(items[0], cfg, _Failing7z("dummy_7z"),
+                                  lambda m, t: logs.append(m))
+        self.assertEqual(rec.result, "失败")
+        self.assertTrue(any("WinRAR" in m for m in logs))  # 确实尝试过回退
+
+    def test_no_fallback_when_unrar_unavailable(self):
+        """未配置 UnRAR 时不回退，直接按 7z 结论报失败。"""
+        d = self.work / "ext"
+        d.mkdir()
+        (d / "损坏.zip").write_bytes(b"PK\x03\x04broken")
+        cfg = Config(self.work / "config.json")
+        cfg.data["winrar_path"] = ""  # 无回退引擎
         items = extract.find_archives(d)
         rec = extract.extract_one(items[0], cfg, _Failing7z("dummy_7z"),
                                   self.quiet_log)
