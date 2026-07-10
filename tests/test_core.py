@@ -215,6 +215,54 @@ class TestArchiveDetection(TempDirTestCase):
         self.assertEqual(bare.stem, "某游戏 [合集]【2024】")
 
 
+# ================= 一键预处理：统一分卷主名 =================
+
+class TestVolumeFix(TempDirTestCase):
+    def test_unify_inconsistent_stems(self):
+        """典型场景：各卷被加了不同后缀 → 统一为首卷主名。"""
+        d = self.work / "游戏A"
+        d.mkdir()
+        for n in ["游戏A.7z.001", "游戏A(1).7z.002", "游戏A - 副本.7z.003"]:
+            (d / n).write_bytes(b"x")
+        plans = preprocess.build_volume_fix_plans(self.work)
+        self.assertEqual(len(plans), 2)
+        preprocess.execute_plans(plans, self.quiet_log)
+        names = sorted(p.name for p in d.iterdir())
+        self.assertEqual(names, ["游戏A.7z.001", "游戏A.7z.002", "游戏A.7z.003"])
+
+    def test_part_volumes_unified(self):
+        (self.work / "a.part1.rar").write_bytes(b"x")
+        (self.work / "b.part2.rar").write_bytes(b"x")
+        plans = preprocess.build_volume_fix_plans(self.work)
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(plans[0].new_name, "a.part2.rar")
+
+    def test_plain_volumes_unified(self):
+        (self.work / "游戏.001").write_bytes(b"x")
+        (self.work / "游戏[2].002").write_bytes(b"x")
+        plans = preprocess.build_volume_fix_plans(self.work)
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(plans[0].new_name, "游戏.002")
+
+    def test_mixed_sets_untouched(self):
+        """卷号重复=同目录多套分卷混放，无法判断归属 → 不动。"""
+        for n in ["x.7z.001", "y.7z.001", "x.7z.002", "y.7z.002"]:
+            (self.work / n).write_bytes(b"x")
+        self.assertEqual(preprocess.build_volume_fix_plans(self.work), [])
+
+    def test_gap_untouched(self):
+        """卷号不连续（可能缺卷）→ 不动。"""
+        (self.work / "a.7z.001").write_bytes(b"x")
+        (self.work / "b.7z.003").write_bytes(b"x")
+        self.assertEqual(preprocess.build_volume_fix_plans(self.work), [])
+
+    def test_consistent_set_untouched(self):
+        """主名一致的正常分卷 → 无需处理。"""
+        for n in ["游戏.7z.001", "游戏.7z.002"]:
+            (self.work / n).write_bytes(b"x")
+        self.assertEqual(preprocess.build_volume_fix_plans(self.work), [])
+
+
 # ================= 模块二：伪装扩展名识别（不需要 7z） =================
 
 class TestSniffDisguise(TempDirTestCase):
