@@ -202,6 +202,14 @@ DEFAULT_SMART_FIX_MIN_MB = 1.0
 _ALL_ARCHIVE_NAME_RES = (_NNN_VOLUME_RE, _BARE_PART_RE, _PART_VOLUME_RE,
                          _R_VOLUME_RE, _Z_VOLUME_RE, _PLAIN_NNN_RE, _SINGLE_RE)
 
+# 任意长度数字后缀（.1 .01 .001 .0001 ...）——分卷成员的通用形态。
+# 注意：这比 _PLAIN_NNN_RE 更宽（不限 3 位），仅用于"绝不改名"的保护性判断，
+# 避免把两位数/四位数分卷的首卷误当独立文件追加扩展名而拆散分卷。
+_NUMERIC_SUFFIX_RE = re.compile(r"^(?P<stem>.+)\.(?P<num>\d+)$")
+
+# 被错误追加了压缩扩展名的分卷首卷，如 game.001.7z / game.exe.001.rar
+_APPENDED_EXT_RE = re.compile(r"(?i)^(?P<base>.+)\.(?P<num>\d+)\.(?P<ext>7z|zip|rar)$")
+
 
 def sniff_archive_format(path: Path) -> Optional[str]:
     """读文件头魔数判断是否为压缩文件，返回 '7z'/'rar'/'zip' 或 None。"""
@@ -216,6 +224,81 @@ def sniff_archive_format(path: Path) -> Optional[str]:
     return None
 
 
+def _numeric_volume_bases(files: list[Path]) -> set[str]:
+    """收集同目录内所有"数字分卷组"的基名。
+
+    基名取数字后缀之前的部分（game.001 → game、game.7z.002 → game.7z）。
+    这些基名下的成员、以及与基名同名的 SFX 首卷（game.exe 对 game.001）
+    都属于分卷组，伪装修正一律不得触碰。
+    """
+    bases: set[str] = set()
+    for f in files:
+        m = _NUMERIC_SUFFIX_RE.match(f.name)
+        if m:
+            bases.add(m.group("stem"))
+    return bases
+
+
+def _belongs_to_volume_set(path: Path, vol_bases: set[str]) -> bool:
+    """判断某文件是否属于分卷组（分卷成员本身，或 SFX 首卷）。
+
+    - 自身带数字后缀：game.001 / game.7z.002 → 是
+    - 自身去掉最后一段扩展名后等于某分卷基名：game.exe（旁边有 game.001）→ 是
+      （SFX 自解压包的首卷常是 .exe，其余卷是 .001/.002）
+    """
+    if _NUMERIC_SUFFIX_RE.match(path.name):
+        return True
+    # 去掉最后一段扩展名后与分卷基名相同 → SFX 首卷
+    stem_wo_ext = path.name[: -len(path.suffix)] if path.suffix else path.name
+    return stem_wo_ext in vol_bases
+
+
+def restore_appended_volume_ext(
+    root: Path,
+    log: Callable[[str, str], None],
+) -> list[tuple[Path, Path]]:
+    """修复此前被错误追加了压缩扩展名的分卷首卷。
+
+    历史/异常情况下 game.001 可能被误改成 game.001.7z，拆散了分卷。
+    当同目录存在该分卷组的其他成员（如 game.002 或 game.002.7z）时，
+    去掉多余的尾部扩展名还原为 game.001，使 7z 能重新按分卷串联。
+    返回 [(原路径, 还原路径), ...]。
+    """
+    restored: list[tuple[Path, Path]] = []
+    for d in {p.parent for p in root.rglob("*") if p.is_file()} | {root}:
+        try:
+            files = [p for p in d.iterdir() if p.is_file()]
+        except OSError:
+            continue
+        names = {p.name for p in files}
+        for f in files:
+            m = _APPENDED_EXT_RE.match(f.name)
+            if not m:
+                continue
+            base, num = m.group("base"), int(m.group("num"))
+            # 确认这是分卷：存在相邻卷号的兄弟文件（去不去多余扩展名都算）
+            sib_next = f"{base}.{num + 1:0{len(m.group('num'))}d}"
+            has_sibling = any(
+                n == sib_next or n.startswith(sib_next + ".") or
+                (n != f.name and _NUMERIC_SUFFIX_RE.match(n) and
+                 n.rsplit(".", 1)[0] == base)
+                for n in names
+            )
+            if not has_sibling:
+                continue
+            target = f.with_name(f"{base}.{m.group('num')}")
+            if target.exists():
+                continue
+            try:
+                f.rename(target)
+            except OSError as e:
+                log(f"[分卷修复] 失败 {f.name}：{e}", "error")
+                continue
+            log(f"[分卷修复] {f.name} → {target.name}（还原被拆散的分卷首卷）", "success")
+            restored.append((f, target))
+    return restored
+
+
 def fix_disguised_extensions(
     root: Path,
     log: Callable[[str, str], None],
@@ -225,40 +308,50 @@ def fix_disguised_extensions(
 
     修正方式为在原名后追加正确扩展名（游戏.jpg → 游戏.jpg.rar），
     不破坏原名信息且保证后续能被压缩包识别规则命中。
-    三类文件不动：已能按名字识别的压缩包/分卷；docx、游戏存档（.save/.sav）、
-    引擎资源包（.pak 等）之类的 zip 容器格式；小于 min_size 字节的文件
-    （游戏存档等小文件常以 zip 格式存储，会被魔数误判为压缩包）。
+
+    分卷感知（关键）：任何属于数字分卷组的文件——分卷成员本身、以及与
+    分卷同基名的 SFX 首卷（game.exe 对 game.001）——一律不改名。否则会把
+    分卷首卷变成独立压缩包，导致 7z 无法串联后续卷（这是本函数的核心约束）。
+    另外不动：已能按名字识别的压缩包；docx/存档/资源包等 zip 容器格式；
+    小于 min_size 的文件（游戏存档常以 zip 存储，会被魔数误判）。
     返回 [(原路径, 新路径), ...]。
     """
     fixed: list[tuple[Path, Path]] = []
+    # 按目录分组，先算出每个目录里的分卷基名
+    dirs: dict[Path, list[Path]] = {}
     for path in sorted(root.rglob("*")):
-        if not path.is_file():
-            continue
-        name = path.name
-        if any(r.match(name) for r in _ALL_ARCHIVE_NAME_RES):
-            continue  # 名字已可识别（含分卷后续卷），不需要修正
-        if path.suffix.lower() in _ZIP_CONTAINER_EXTS:
-            continue  # zip 容器格式，内容是 PK 头属正常，不能改名
-        if min_size > 0:
-            try:
-                if path.stat().st_size < min_size:
-                    continue  # 小文件大概率是存档/配置等，不做伪装识别
-            except OSError:
+        if path.is_file():
+            dirs.setdefault(path.parent, []).append(path)
+    for d, files in dirs.items():
+        vol_bases = _numeric_volume_bases(files)
+        for path in files:
+            name = path.name
+            if any(r.match(name) for r in _ALL_ARCHIVE_NAME_RES):
+                continue  # 名字已可识别（含分卷后续卷），不需要修正
+            if _belongs_to_volume_set(path, vol_bases):
+                continue  # 分卷成员 / SFX 首卷：改名会拆散分卷，绝不触碰
+            if path.suffix.lower() in _ZIP_CONTAINER_EXTS:
+                continue  # zip 容器格式，内容是 PK 头属正常，不能改名
+            if min_size > 0:
+                try:
+                    if path.stat().st_size < min_size:
+                        continue  # 小文件大概率是存档/配置等，不做伪装识别
+                except OSError:
+                    continue
+            fmt = sniff_archive_format(path)
+            if fmt is None:
                 continue
-        fmt = sniff_archive_format(path)
-        if fmt is None:
-            continue
-        new_path = path.with_name(f"{name}.{fmt}")
-        if new_path.exists():
-            log(f"[扩展名修正] 跳过 {name}：目标 {new_path.name} 已存在", "warn")
-            continue
-        try:
-            path.rename(new_path)
-        except OSError as e:
-            log(f"[扩展名修正] 失败 {name}：{e}", "error")
-            continue
-        log(f"[扩展名修正] {name} → {new_path.name}（内容为 {fmt} 格式）", "success")
-        fixed.append((path, new_path))
+            new_path = path.with_name(f"{name}.{fmt}")
+            if new_path.exists():
+                log(f"[扩展名修正] 跳过 {name}：目标 {new_path.name} 已存在", "warn")
+                continue
+            try:
+                path.rename(new_path)
+            except OSError as e:
+                log(f"[扩展名修正] 失败 {name}：{e}", "error")
+                continue
+            log(f"[扩展名修正] {name} → {new_path.name}（内容为 {fmt} 格式）", "success")
+            fixed.append((path, new_path))
     return fixed
 
 
@@ -539,8 +632,12 @@ def extract_batch(
     except (TypeError, ValueError):
         smart_fix_min = int(DEFAULT_SMART_FIX_MIN_MB * 1024 * 1024)
     if items is None:
-        # 先做伪装扩展名修正，让后续按名字的扫描能命中这些文件
+        # 先修复被错误追加扩展名而拆散的分卷首卷（如 game.001.7z → game.001），
+        # 让后续扫描能重新按分卷串联；再做伪装扩展名修正
         if smart_fix:
+            for old, new in restore_appended_volume_ext(scan_root, log):
+                emit(ExtractRecord(str(old), "成功", f"还原为 {new.name}",
+                                   op="分卷修复"))
             for old, new in fix_disguised_extensions(scan_root, log, smart_fix_min):
                 emit(ExtractRecord(str(old), "成功", f"修正为 {new.name}",
                                    op="扩展名修正"))
