@@ -47,8 +47,10 @@ _R_VOLUME_RE = re.compile(r"(?i)^(?P<stem>.+)\.r\d{2}$")
 _Z_VOLUME_RE = re.compile(r"(?i)^(?P<stem>.+)\.z\d{2}$")
 # 无格式中缀的纯数字分卷（HJSplit 风格：游戏.001 / 游戏.002）
 _PLAIN_NNN_RE = re.compile(r"^(?P<stem>.+)\.(?P<num>\d{3})$")
-# 普通单文件压缩包
-_SINGLE_RE = re.compile(r"(?i)^(?P<stem>.+)\.(?P<fmt>7z|zip|rar)$")
+# 普通单文件压缩包。除 7z/zip/rar 外，tar 及其压缩变体（tar.gz/tgz 等）
+# 与 gz/bz2/xz 单文件压缩，7z.exe 均可直接解压
+_SINGLE_RE = re.compile(
+    r"(?i)^(?P<stem>.+)\.(?P<fmt>7z|zip|rar|tar|tgz|tbz2?|txz|gz|bz2|xz)$")
 
 
 @dataclass

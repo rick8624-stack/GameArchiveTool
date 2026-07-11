@@ -143,6 +143,16 @@ class TestArchiveDetection(TempDirTestCase):
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0].main_file.name, "part01.rar")
 
+    def test_tar_family_recognized_as_single(self):
+        """tar 及其压缩变体 / gz / bz2 / xz 均识别为可解压单文件（7z 能解）。"""
+        self.touch("游戏.tar", "游戏.tar.gz", "备份.tgz",
+                   "数据.tar.bz2", "资源.tar.xz", "log.gz")
+        items = self.find()
+        names = {it.main_file.name for it in items}
+        self.assertEqual(names, {"游戏.tar", "游戏.tar.gz", "备份.tgz",
+                                 "数据.tar.bz2", "资源.tar.xz", "log.gz"})
+        self.assertTrue(all(it.kind == "single" for it in items))
+
     def test_name_ending_with_part_is_single(self):
         """rampart1.rar 不是分卷，是独立压缩包。"""
         self.touch("rampart1.rar")
