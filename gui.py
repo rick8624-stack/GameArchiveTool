@@ -272,7 +272,7 @@ class App:
         r3 = ttk.Frame(opt)
         r3.pack(fill="x", pady=(4, 0))
         ttk.Checkbutton(
-            r3, text="强制解压（分卷缺失/损坏时仍强制解压，结果可能不完整、不回退）",
+            r3, text="强制解压（未加密包损坏时抢救部分文件；加密+密码错误时不强解，避免产生0KB文件）",
             variable=self.force_extract_var).pack(side="left")
 
         # ---- 文件名清理 ----

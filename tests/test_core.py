@@ -984,6 +984,53 @@ class TestCompressFlow(TempDirTestCase):
         self.assertTrue(sz.test(arc, "secret").ok)
 
 
+@unittest.skipUnless(SEVENZIP, "未找到 7z.exe，跳过加密强制解压测试")
+class TestForceExtractEncrypted(TempDirTestCase):
+    """回归：强制解压绝不能用错误密码解加密包（否则产 0KB 垃圾并删源）。"""
+
+    def _make_encrypted(self):
+        src = self.work / "src"
+        src.mkdir()
+        (src / "data.bin").write_bytes(os.urandom(120000))
+        arc = self.work / "scan" / "enc.7z"
+        arc.parent.mkdir()
+        # 数据加密（无 -mhe）：错误密码 7z l 也能列文件名，但解不了数据
+        subprocess.run([SEVENZIP, "a", "-p右密码", "-bso0", "-bsp0",
+                        str(arc), str(src / "data.bin")],
+                       check=True, capture_output=True)
+        return arc
+
+    def test_force_skips_encrypted_wrong_password_no_0kb_no_delete(self):
+        arc = self._make_encrypted()
+        cfg = Config(self.work / "config.json")
+        cfg.data.update(seven_zip_path=SEVENZIP, force_extract=True,
+                        delete_after_extract=True, delete_to_recycle=False)
+        # 密码池里没有正确密码
+        sz = SevenZip(SEVENZIP)
+        recs, failed, _ = extract.extract_batch(
+            cfg, sz, self.quiet_log, scan_root=arc.parent)
+        # 强制解压被跳过 → 报失败（密码错误），而不是假成功
+        self.assertTrue(all(r.result == "失败" for r in recs if r.op == "解压"))
+        # 未产生任何 0KB 垃圾文件（只剩原压缩包）
+        leftovers = [p for p in arc.parent.rglob("*") if p.is_file()]
+        self.assertEqual(leftovers, [arc])
+        # 原压缩包未被删除
+        self.assertTrue(arc.is_file() and arc.stat().st_size > 0)
+
+    def test_force_not_needed_with_correct_password(self):
+        """正确密码在池中时正常解压，与强制解压无关。"""
+        arc = self._make_encrypted()
+        cfg = Config(self.work / "config.json")
+        cfg.data.update(seven_zip_path=SEVENZIP, force_extract=True)
+        cfg.add_password("右密码")
+        sz = SevenZip(SEVENZIP)
+        recs, _, _ = extract.extract_batch(
+            cfg, sz, self.quiet_log, scan_root=arc.parent)
+        self.assertTrue(any(r.result == "成功" for r in recs))
+        self.assertTrue((arc.parent / "data.bin").is_file())
+        self.assertEqual((arc.parent / "data.bin").stat().st_size, 120000)
+
+
 class TestRenameDefaultAndUndo(TempDirTestCase):
     def test_default_numbering(self):
         """默认编号模式：一级子文件夹按名称排序改为 1, 2, 3..."""

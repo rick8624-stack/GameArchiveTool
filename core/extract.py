@@ -409,10 +409,17 @@ def extract_one(
     hit_password: Optional[str] = None
     listing: Optional[ListResult] = None
     last_output = ""
-    # 强制解压兜底：记录首个通过 7z l 快速检查的密码（即使后续 t 校验失败）。
-    # 分卷缺失时，正确密码也会在 t 阶段报错，靠它保住能用的密码
-    list_ok_pwd: Optional[str] = None
-    list_ok_listing: Optional[ListResult] = None
+    # 强制解压兜底：只针对「数据损坏但内容可读」的未加密包，用一个已知无
+    # 密码问题的密码把能解的部分抢救出来。
+    # 关键安全约束（修复 0KB bug）：绝不能用错误密码强制解压——数据加密的包
+    # 用错误密码 7z l 也会通过，但强解只会产出一堆 0KB 垃圾文件。因此：
+    #   1) 见过「密码错误」→ 包是加密且密码不对，禁止强制解压
+    #   2) 包内有加密条目（listing.encrypted）→ 密码没验证通过就禁止强制解压
+    #   3) 只有 t 校验报「损坏/数据错误」（非密码、非分卷缺失、非无法识别）时，
+    #      才把该密码记为强制解压候选
+    force_pwd: Optional[str] = None
+    force_listing: Optional[ListResult] = None
+    saw_password_error = False
 
     for pwd in candidates:
         label = "无密码" if pwd == "" else f"密码「{pwd}」"
@@ -422,6 +429,8 @@ def extract_one(
         if not lr.ok:
             last_output = lr.output
             reason = SevenZip.classify_failure(lr.output, archive)
+            if "密码" in reason:
+                saw_password_error = True
             if "分卷" in reason or "无法识别" in reason:
                 log(f"    快速检查失败：{reason}", "warn")
                 if not force:
@@ -429,9 +438,6 @@ def extract_one(
                 continue  # 强制模式：不因分卷不完整/无法识别提前终止
             log(f"    {label} 快速验证未通过", "info")
             continue
-        # 记录首个通过 list 的密码，供强制解压在 t 校验失败时兜底
-        if list_ok_pwd is None:
-            list_ok_pwd, list_ok_listing = pwd, lr
         # 跳过模式（二）：包内唯一顶层文件夹在目标位置已存在且非空 → 视为已解压过
         if skip_existing and lr.single_top_dir:
             tgt = base / lr.single_top_dir
@@ -452,11 +458,17 @@ def extract_one(
         # 分卷不完整/根本不是压缩文件时，继续试其他密码没有意义，提前结束。
         # 注意 CRC/数据错误不提前结束——加密压缩包密码不对时也会报这类错误。
         reason = SevenZip.classify_failure(result.output, archive)
+        if "密码" in reason:
+            saw_password_error = True
+        elif ("分卷" in reason or "损坏" in reason) and "无法识别" not in reason \
+                and not lr.encrypted and force and force_pwd is None:
+            # 未加密包的数据损坏：这个密码本身没问题，可作强制解压候选
+            force_pwd, force_listing = pwd, lr
         if "分卷" in reason or "无法识别" in reason:
             log(f"    测试失败：{reason}", "warn")
             if not force:
                 break
-            continue  # 强制模式：分卷不完整仍继续，已通过 list 的密码即可强制解压
+            continue  # 强制模式：分卷不完整仍继续
 
     # WinRAR 引擎回退（一）：7z 密码测试全部失败且目标是 rar 系文件时，
     # 用 UnRAR 重试密码池。部分 WinRAR 新版本生成的加密 rar，7z 无法解压但 UnRAR 可以。
@@ -469,12 +481,17 @@ def extract_one(
         if unrar_engine is not None:
             hit_password = fb_pwd
 
-    # 强制解压兜底：校验没通过但有能读取文件头的密码，就用它强制解压
-    if hit_password is None and force and list_ok_pwd is not None:
-        hit_password = list_ok_pwd
-        listing = list_ok_listing
-        lbl = "无密码" if hit_password == "" else f"密码「{hit_password}」"
-        log(f"    [强制解压] 校验未通过，仍用 {lbl} 强制解压（结果可能不完整）", "warn")
+    # 强制解压兜底：仅当找到「未加密包的数据损坏」候选、且从未见过密码错误时才启用。
+    # 加密包/密码错误一律不强制解压——用错误密码只会产出 0KB 垃圾（历史 bug 根因）
+    if hit_password is None and force:
+        if saw_password_error:
+            log("    [强制解压] 已跳过：包为加密且密码不匹配，"
+                "强制解压只会产出空文件（不强解）", "warn")
+        elif force_pwd is not None:
+            hit_password = force_pwd
+            listing = force_listing
+            lbl = "无密码" if hit_password == "" else f"密码「{hit_password}」"
+            log(f"    [强制解压] 数据损坏，用 {lbl} 强制解压（结果可能不完整）", "warn")
 
     if hit_password is None:
         reason = SevenZip.classify_failure(last_output, archive)
