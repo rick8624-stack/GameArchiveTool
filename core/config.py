@@ -26,6 +26,13 @@ DEFAULTS = {
     "smart_ext_fix": True,             # 智能识别伪装扩展名（按文件头魔数修正）
     "smart_fix_min_mb": 1.0,           # 小于此大小(MB)的文件不做伪装识别（防游戏存档误判）
     "nested_extract": True,            # 嵌套解压（压缩包里的压缩包，最多 4 层）
+    "compress_format": "7z",           # 一键压缩格式：7z / zip
+    "compress_level": 5,               # 压缩级别 0–9（0=仅存储最快，9=最强最慢）
+    "compress_password": "",           # 压缩密码（留空=不加密）
+    "compress_header_encrypt": True,   # 7z 格式下连文件名一起加密（-mhe）
+    "compress_volume_size": "",        # 分卷大小（如 2g / 700m，留空=不分卷）
+    "compress_delete_source": False,   # 压缩成功后删除源文件夹
+    "compress_output_dir": "",         # 压缩包输出目录（留空=放在源根目录）
     "rename_mode": "csv",              # 重命名模式：csv=对照表 / seq=默认编号 1,2,3...
     "preprocess_suffix": "删",         # 文件名清理规则，多条用 ; 分隔
     "preprocess_use_regex": False,     # 清理规则是否按正则解释

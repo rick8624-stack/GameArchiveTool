@@ -20,7 +20,7 @@ from pathlib import Path
 # 保证从任意工作目录运行时都能 import 项目模块
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from core import extract, preprocess
+from core import compress, extract, preprocess
 from core import rename as rename_mod
 from core.config import Config
 from core.progress_store import ProgressStore
@@ -902,6 +902,86 @@ class TestForceExtract(TempDirTestCase):
                                   lambda m, t: logs.append(m))
         self.assertEqual(rec.result, "成功", rec.detail)
         self.assertFalse(any("WinRAR" in m or "UnRAR" in m for m in logs))
+
+
+class TestCompressLogic(TempDirTestCase):
+    """一键压缩的纯逻辑（不依赖 7z）：一级文件夹扫描、空文件夹跳过。"""
+
+    def test_find_top_folders_skips_empty_and_files(self):
+        (self.work / "游戏A").mkdir()
+        (self.work / "游戏A" / "data.bin").write_bytes(b"x")
+        (self.work / "空文件夹").mkdir()               # 空 → 跳过
+        (self.work / "游戏B [English]").mkdir()
+        (self.work / "游戏B [English]" / "x.dat").write_bytes(b"y")
+        (self.work / "散落文件.txt").write_bytes(b"z")  # 文件 → 跳过
+        names = {f.name for f in compress.find_top_folders(self.work)}
+        self.assertEqual(names, {"游戏A", "游戏B [English]"})
+
+
+@unittest.skipUnless(SEVENZIP, "未找到 7z.exe，跳过压缩流程测试")
+class TestCompressFlow(TempDirTestCase):
+    def setUp(self):
+        super().setUp()
+        self.src = self.work / "src"
+        self.src.mkdir()
+        (self.src / "游戏A").mkdir()
+        (self.src / "游戏A" / "readme.txt").write_text("内容A", encoding="utf-8")
+        (self.src / "游戏B").mkdir()
+        (self.src / "游戏B" / "readme.txt").write_text("内容B", encoding="utf-8")
+
+    def _cfg(self, **over):
+        cfg = Config(self.work / "config.json")
+        cfg.data["seven_zip_path"] = SEVENZIP
+        cfg.data.update(over)
+        return cfg
+
+    def test_compress_each_folder_and_roundtrip(self):
+        """每个子文件夹压成单独 7z，且能被自己的解压流程还原。"""
+        cfg = self._cfg()
+        sz = SevenZip(SEVENZIP)
+        records, stopped = compress.compress_batch(
+            cfg, sz, self.quiet_log, scan_root=self.src)
+        self.assertFalse(stopped)
+        self.assertEqual({r.result for r in records}, {"成功"})
+        self.assertTrue((self.src / "游戏A.7z").is_file())
+        self.assertTrue((self.src / "游戏B.7z").is_file())
+        # 还原：解压 游戏A.7z 到新目录，包内顶层应为 游戏A/
+        out = self.work / "out"
+        items = extract.find_archives(self.src)
+        a = next(i for i in items if i.main_file.name == "游戏A.7z")
+        extract.extract_one(a, cfg, sz, self.quiet_log, dest_parent=out)
+        self.assertEqual((out / "游戏A" / "readme.txt").read_text(encoding="utf-8"),
+                         "内容A")
+
+    def test_skip_existing_archive(self):
+        """跳过模式：目标压缩包已存在则跳过。"""
+        cfg = self._cfg()
+        sz = SevenZip(SEVENZIP)
+        compress.compress_batch(cfg, sz, self.quiet_log, scan_root=self.src)
+        records, _ = compress.compress_batch(
+            cfg, sz, self.quiet_log, scan_root=self.src)
+        self.assertEqual({r.result for r in records}, {"跳过"})
+
+    def test_output_dir_and_zip_format(self):
+        """输出到独立目录 + zip 格式。"""
+        out = self.work / "packed"
+        cfg = self._cfg(compress_format="zip",
+                        compress_output_dir=str(out))
+        sz = SevenZip(SEVENZIP)
+        records, _ = compress.compress_batch(
+            cfg, sz, self.quiet_log, scan_root=self.src)
+        self.assertEqual({r.result for r in records}, {"成功"})
+        self.assertTrue((out / "游戏A.zip").is_file())
+        self.assertTrue((out / "游戏B.zip").is_file())
+
+    def test_encrypted_compress_needs_password(self):
+        """加密压缩：无密码测试应失败，正确密码通过。"""
+        cfg = self._cfg(compress_password="secret")
+        sz = SevenZip(SEVENZIP)
+        compress.compress_batch(cfg, sz, self.quiet_log, scan_root=self.src)
+        arc = self.src / "游戏A.7z"
+        self.assertFalse(sz.test(arc, "").ok)
+        self.assertTrue(sz.test(arc, "secret").ok)
 
 
 class TestRenameDefaultAndUndo(TempDirTestCase):

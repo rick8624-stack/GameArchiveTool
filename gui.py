@@ -16,7 +16,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter.scrolledtext import ScrolledText
 
-from core import extract, preprocess
+from core import compress, extract, preprocess
 from core import rename as rename_mod
 from core.config import Config
 from core.progress_store import ProgressStore
@@ -88,6 +88,14 @@ class App:
         self.nested_var = tk.BooleanVar(value=True)
         self.pre_rule_var = tk.StringVar(value="删")
         self.pre_regex_var = tk.BooleanVar(value=False)
+        # 一键压缩
+        self.cmp_format_var = tk.StringVar(value="7z")
+        self.cmp_level_var = tk.StringVar(value="5")
+        self.cmp_password_var = tk.StringVar(value="")
+        self.cmp_header_enc_var = tk.BooleanVar(value=True)
+        self.cmp_volume_var = tk.StringVar(value="")
+        self.cmp_delete_var = tk.BooleanVar(value=False)
+        self.cmp_output_var = tk.StringVar(value="")
 
     # ================= UI 构建 =================
 
@@ -162,6 +170,10 @@ class App:
             act, text="一键重命名（1, 2, 3...）", style="Big.TButton",
             command=self._start_quick_rename)
         self.btn_quick_rename.pack(fill="x", pady=4)
+        self.btn_quick_compress = ttk.Button(
+            act, text="一键压缩（每个子文件夹→单独包）", style="Big.TButton",
+            command=self._start_compress)
+        self.btn_quick_compress.pack(fill="x", pady=4)
 
         aux = ttk.Frame(act)
         aux.pack(fill="x", pady=(6, 0))
@@ -226,7 +238,6 @@ class App:
         self.settings_win = win = tk.Toplevel(self.root)
         win.title("详细设置")
         win.transient(self.root)
-        win.geometry("720x430")
         win.protocol("WM_DELETE_WINDOW", self._close_settings)
 
         pad = {"padx": 8, "pady": 4}
@@ -298,8 +309,44 @@ class App:
         ttk.Label(rr, text="（结果显示在主窗口日志中，可回退）",
                   foreground="#888").pack(side="left", padx=8)
 
+        # ---- 一键压缩 ----
+        cmp = ttk.LabelFrame(win, text="一键压缩（每个一级子文件夹 → 单独压缩包）", padding=6)
+        cmp.pack(fill="x", **pad)
+        cr1 = ttk.Frame(cmp)
+        cr1.pack(fill="x")
+        ttk.Label(cr1, text="格式：").pack(side="left")
+        ttk.Combobox(cr1, textvariable=self.cmp_format_var, values=["7z", "zip"],
+                     width=5, state="readonly").pack(side="left")
+        ttk.Label(cr1, text="  压缩级别(0-9)：").pack(side="left")
+        ttk.Spinbox(cr1, from_=0, to=9, textvariable=self.cmp_level_var,
+                    width=4).pack(side="left")
+        ttk.Label(cr1, text="  分卷大小：").pack(side="left")
+        ttk.Entry(cr1, textvariable=self.cmp_volume_var, width=8).pack(side="left")
+        ttk.Label(cr1, text="(如 2g/700m，空=不分卷)", foreground="#888").pack(side="left")
+        cr2 = ttk.Frame(cmp)
+        cr2.pack(fill="x", pady=(4, 0))
+        ttk.Label(cr2, text="压缩密码：").pack(side="left")
+        ttk.Entry(cr2, textvariable=self.cmp_password_var, width=18).pack(side="left")
+        ttk.Checkbutton(cr2, text="7z 加密文件名(-mhe)",
+                        variable=self.cmp_header_enc_var).pack(side="left", padx=8)
+        ttk.Checkbutton(cr2, text="压缩后删除源文件夹",
+                        variable=self.cmp_delete_var).pack(side="left", padx=8)
+        self._path_row(cmp, "输出目录：", self.cmp_output_var,
+                       self._browse_cmp_output, hint="(空=放在源目录)")
+
         ttk.Button(win, text="关闭（设置自动保存）",
                    command=self._close_settings).pack(pady=8)
+
+        # 按内容自适应尺寸：先让 tk 计算各控件所需大小，再据此定窗口，
+        # 保证所有按钮/文本框都能完整显示，无需手动拉伸
+        win.update_idletasks()
+        w = win.winfo_reqwidth() + 20
+        h = win.winfo_reqheight() + 20
+        win.minsize(w, h)
+        # 居中到主窗口
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - w) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - h) // 2
+        win.geometry(f"{w}x{h}+{max(x, 0)}+{max(y, 0)}")
 
     @staticmethod
     def _path_row(parent, label, var, browse_cmd, hint=""):
@@ -337,6 +384,13 @@ class App:
         self.nested_var.set(d["nested_extract"])
         self.pre_rule_var.set(d["preprocess_suffix"])
         self.pre_regex_var.set(d["preprocess_use_regex"])
+        self.cmp_format_var.set(d["compress_format"])
+        self.cmp_level_var.set(str(d["compress_level"]))
+        self.cmp_password_var.set(d["compress_password"])
+        self.cmp_header_enc_var.set(d["compress_header_encrypt"])
+        self.cmp_volume_var.set(d["compress_volume_size"])
+        self.cmp_delete_var.set(d["compress_delete_source"])
+        self.cmp_output_var.set(d["compress_output_dir"])
         self._refresh_pw_list()
 
     def _sync_config(self):
@@ -360,6 +414,16 @@ class App:
         d["nested_extract"] = self.nested_var.get()
         d["preprocess_suffix"] = self.pre_rule_var.get()
         d["preprocess_use_regex"] = self.pre_regex_var.get()
+        d["compress_format"] = self.cmp_format_var.get()
+        try:
+            d["compress_level"] = max(0, min(9, int(self.cmp_level_var.get())))
+        except ValueError:
+            pass  # 输入非法时保留原值
+        d["compress_password"] = self.cmp_password_var.get()
+        d["compress_header_encrypt"] = self.cmp_header_enc_var.get()
+        d["compress_volume_size"] = self.cmp_volume_var.get().strip()
+        d["compress_delete_source"] = self.cmp_delete_var.get()
+        d["compress_output_dir"] = self.cmp_output_var.get().strip()
         self.config.save()
 
     def _on_close(self):
@@ -378,6 +442,11 @@ class App:
         path = filedialog.askdirectory(title="选择目标解压目录")
         if path:
             self.target_var.set(str(Path(path)))
+
+    def _browse_cmp_output(self):
+        path = filedialog.askdirectory(title="选择压缩包输出目录")
+        if path:
+            self.cmp_output_var.set(str(Path(path)))
 
     def _browse_7z(self):
         path = filedialog.askopenfilename(title="选择 7z.exe",
@@ -482,7 +551,8 @@ class App:
     def _set_running(self, running: bool):
         state = "disabled" if running else "normal"
         for btn in (self.btn_quick_extract, self.btn_quick_prep,
-                    self.btn_quick_rename, self.btn_ren_undo):
+                    self.btn_quick_rename, self.btn_quick_compress,
+                    self.btn_ren_undo):
             btn.configure(state=state)
         # 重试按钮只有存在失败项时才恢复可用
         self.btn_retry.configure(
@@ -757,6 +827,45 @@ class App:
             if p.result:
                 self.report_records.append(
                     ReportRecord(str(p.path), "预处理", p.result, p.note))
+
+    # ================= 一键压缩 =================
+
+    def _start_compress(self):
+        """一键压缩：把源目录下每个一级子文件夹分别压缩成单独的包。"""
+        root_dir = self._get_root_dir()
+        if root_dir is None:
+            return
+        sz = SevenZip(self.sz_path_var.get().strip())
+        if not sz.available():
+            messagebox.showerror("错误", f"未找到 7z.exe：{sz.exe_path}\n"
+                                         "请在「详细设置」中设置正确路径")
+            return
+        self._reset_counts()
+        self._start_worker(self._worker_compress, root_dir, sz)
+
+    def _worker_compress(self, root_dir: Path, sz: SevenZip):
+        def on_record(rec: compress.CompressRecord):
+            self.report_records.append(ReportRecord(
+                rec.folder, rec.op, rec.result, rec.detail, "", rec.elapsed))
+            self._emit(type="count", kind=rec.result)
+
+        records, stopped = compress.compress_batch(
+            self.config, sz, self._wlog, scan_root=root_dir,
+            should_stop=self.stop_event.is_set,
+            file_progress=lambda p: self._emit(type="file", percent=p),
+            total_progress=lambda c, t, n: self._emit(
+                type="total", current=c, total=t, name=n),
+            on_record=on_record,
+        )
+        failures = [r for r in records if r.result == "失败"]
+        if failures:
+            self._wlog(f"—— 压缩失败清单（{len(failures)} 项）——", "error")
+            for r in failures:
+                self._wlog(f"  {r.folder}  →  {r.detail}", "error")
+        if stopped:
+            self._wlog("—— 压缩已停止 ——", "warn")
+        else:
+            self._wlog("—— 一键压缩完成，可点「导出报告」保存处理明细 ——", "info")
 
     # ================= 一键重命名（默认编号） / 对照表重命名 =================
 
