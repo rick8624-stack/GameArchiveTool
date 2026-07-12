@@ -141,6 +141,34 @@ class SevenZip:
             progress_cb,
         )
 
+    def add(
+        self,
+        archive: Path,
+        source: Path,
+        password: str = "",
+        level: int = 5,
+        fmt: str = "7z",
+        header_encrypt: bool = True,
+        volume_size: str = "",
+        progress_cb: Optional[Callable[[int], None]] = None,
+    ) -> SevenZipResult:
+        """7z a 压缩：把 source（文件夹或文件）打包进 archive。
+
+        source 传文件夹本身时，包内顶层即该文件夹名，正好对上解压侧
+        「唯一顶层文件夹」的约定。level 0–9（0=仅存储最快）；password 非空
+        时加密，7z 格式可再开 -mhe 连文件名一起加密；volume_size 非空时分卷
+        （如 "2g"/"700m"）。zip 不支持 -mhe，按格式分支。
+        """
+        args = ["a", f"-t{fmt}", str(archive), str(source),
+                f"-mx={level}", "-y", "-bsp1"]
+        if password:
+            args.append(f"-p{password}")
+            if fmt == "7z" and header_encrypt:
+                args.append("-mhe=on")
+        if volume_size:
+            args.append(f"-v{volume_size}")
+        return self._run(args, progress_cb)
+
     def list_archive(self, archive: Path, password: str = "") -> ListResult:
         """7z l -slt 快速列出压缩包内容（只读文件头，不解数据）。
 
