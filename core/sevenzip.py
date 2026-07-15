@@ -79,12 +79,13 @@ class ListResult:
     """7z l 列表结果：用于快速密码验证、双重嵌套判断和磁盘空间预检。"""
 
     def __init__(self, ok: bool, output: str, top_names: set[str],
-                 top_dirs: set[str], total_size: int):
+                 top_dirs: set[str], total_size: int, encrypted: bool = False):
         self.ok = ok
         self.output = output
         self.top_names = top_names     # 压缩包内的顶层条目名集合
         self.top_dirs = top_dirs       # 顶层条目中是文件夹的那些
         self.total_size = total_size   # 未压缩总大小（字节）
+        self.encrypted = encrypted     # 包内存在加密条目（-slt 的 Encrypted = +）
 
     @property
     def single_top_dir(self) -> str | None:
@@ -161,6 +162,10 @@ class SevenZip:
         """
         args = ["a", f"-t{fmt}", str(archive), str(source),
                 f"-mx={level}", "-y", "-bsp1"]
+        if fmt == "7z":
+            # 限制 LZMA2 词典与线程数，防止大文件夹压缩时内存暴涨导致
+            # 系统卡死/压缩失败（默认高级别词典 + 多线程可吃掉数 GB 内存）
+            args += ["-md=32m", "-mmt=2"]
         if password:
             args.append(f"-p{password}")
             if fmt == "7z" and header_encrypt:
@@ -203,9 +208,13 @@ class SevenZip:
         top_names: set[str] = set()
         top_dirs: set[str] = set()
         total_size = 0
+        encrypted = False      # 包内是否存在加密条目（Encrypted = +）
         cur_path = ""          # 当前块的 Path（-slt 中 Path 总在块首）
         cur_is_top = False     # 当前块的条目是否是顶层条目
         for line in proc.stdout.splitlines():
+            if line.startswith("Encrypted = ") and \
+                    line[len("Encrypted = "):].strip() == "+":
+                encrypted = True
             if line.startswith("Path = "):
                 rel = line[len("Path = "):].strip()
                 parts = re.split(r"[\\/]", rel, maxsplit=1)
@@ -229,7 +238,7 @@ class SevenZip:
                     top_dirs.add(cur_path)
         # 成功时不保留原始输出（大压缩包的文件清单可能非常大，且只有
         # 失败时才需要拿输出做原因分类）
-        return ListResult(True, "", top_names, top_dirs, total_size)
+        return ListResult(True, "", top_names, top_dirs, total_size, encrypted)
 
     # ---------- 失败原因分类 ----------
 

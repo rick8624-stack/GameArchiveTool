@@ -861,6 +861,15 @@ class _MissingVolume7z(SevenZip):
         return SevenZipResult(2, "ERROR: Missing volume : game.002")
 
 
+class _EmptyOutput7z(_MissingVolume7z):
+    """模拟强制解压只产出 0KB 垃圾（密码不对/首卷即损的典型表现）。"""
+
+    def extract(self, archive, out_dir, password="", progress_cb=None):
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        (Path(out_dir) / "垃圾.bin").write_bytes(b"")   # 0 字节
+        return SevenZipResult(2, "ERROR: Data error")
+
+
 class TestForceExtract(TempDirTestCase):
     def _make_item(self):
         d = self.work / "ext"
@@ -890,6 +899,19 @@ class TestForceExtract(TempDirTestCase):
         self.assertIn("强制解压", rec.detail)
         self.assertTrue((d / "部分文件.bin").exists())
         self.assertTrue(any("强制" in m for m in logs))
+
+    def test_force_with_zero_output_reports_failure(self):
+        """回归：强制解压产物全为 0KB 时必须记失败，源文件不删。"""
+        item, d = self._make_item()
+        cfg = Config(self.work / "config.json")
+        cfg.data["force_extract"] = True
+        cfg.data["delete_after_extract"] = True   # 即使开了删源
+        cfg.data["delete_to_recycle"] = False
+        rec = extract.extract_one(item, cfg, _EmptyOutput7z("dummy_7z"),
+                                  self.quiet_log)
+        self.assertEqual(rec.result, "失败")
+        self.assertIn("无有效产物", rec.detail)
+        self.assertTrue((d / "游戏.7z").is_file())   # 源包完好
 
     def test_force_does_not_fallback_unrar(self):
         """强制模式按用户要求不回退 UnRAR：即使配置了 UnRAR 也不调用它。"""
@@ -974,6 +996,41 @@ class TestCompressFlow(TempDirTestCase):
         self.assertTrue((out / "游戏A.zip").is_file())
         self.assertTrue((out / "游戏B.zip").is_file())
 
+    def test_bad_archive_never_deletes_source(self):
+        """回归：压缩产物校验不过时绝不删源，且清理残缺产物。
+
+        模拟"7z a 返回 0 但产物是坏的"（内存不足等场景）：add 只写一个
+        几字节的假包。删源开着也必须保住源文件夹。"""
+        class _Broken7z(SevenZip):
+            def add(self, archive, source, password="", level=5, fmt="7z",
+                    header_encrypt=True, volume_size="", progress_cb=None):
+                Path(archive).write_bytes(b"7z\xbc\xaf\x27\x1cbad")
+                return SevenZipResult(0, "Everything is Ok")   # 谎报成功
+
+        cfg = self._cfg(compress_delete_source=True)
+        records, _ = compress.compress_batch(
+            cfg, _Broken7z(SEVENZIP), self.quiet_log, scan_root=self.src)
+        self.assertEqual({r.result for r in records}, {"失败"})
+        for r in records:
+            self.assertIn("校验未通过", r.detail)
+        # 源文件夹完好
+        self.assertTrue((self.src / "游戏A" / "readme.txt").is_file())
+        self.assertTrue((self.src / "游戏B" / "readme.txt").is_file())
+        # 残缺产物已清理，跳过模式不会误判"已存在"
+        self.assertFalse((self.src / "游戏A.7z").exists())
+        self.assertFalse((self.src / "游戏B.7z").exists())
+
+    def test_delete_source_only_after_verify(self):
+        """删源开启 + 真实 7z：校验通过后才删源，产物可完整还原。"""
+        cfg = self._cfg(compress_delete_source=True)
+        cfg.data["delete_to_recycle"] = False
+        sz = SevenZip(SEVENZIP)
+        records, _ = compress.compress_batch(
+            cfg, sz, self.quiet_log, scan_root=self.src)
+        self.assertEqual({r.result for r in records}, {"成功"})
+        self.assertFalse((self.src / "游戏A").exists())   # 源已删
+        self.assertTrue(sz.test(self.src / "游戏A.7z").ok)  # 产物完好
+
     def test_encrypted_compress_needs_password(self):
         """加密压缩：无密码测试应失败，正确密码通过。"""
         cfg = self._cfg(compress_password="secret")
@@ -982,6 +1039,53 @@ class TestCompressFlow(TempDirTestCase):
         arc = self.src / "游戏A.7z"
         self.assertFalse(sz.test(arc, "").ok)
         self.assertTrue(sz.test(arc, "secret").ok)
+
+
+@unittest.skipUnless(SEVENZIP, "未找到 7z.exe，跳过加密强制解压测试")
+class TestForceExtractEncrypted(TempDirTestCase):
+    """回归：强制解压绝不能用错误密码解加密包（否则产 0KB 垃圾并删源）。"""
+
+    def _make_encrypted(self):
+        src = self.work / "src"
+        src.mkdir()
+        (src / "data.bin").write_bytes(os.urandom(120000))
+        arc = self.work / "scan" / "enc.7z"
+        arc.parent.mkdir()
+        # 数据加密（无 -mhe）：错误密码 7z l 也能列文件名，但解不了数据
+        subprocess.run([SEVENZIP, "a", "-p右密码", "-bso0", "-bsp0",
+                        str(arc), str(src / "data.bin")],
+                       check=True, capture_output=True)
+        return arc
+
+    def test_force_skips_encrypted_wrong_password_no_0kb_no_delete(self):
+        arc = self._make_encrypted()
+        cfg = Config(self.work / "config.json")
+        cfg.data.update(seven_zip_path=SEVENZIP, force_extract=True,
+                        delete_after_extract=True, delete_to_recycle=False)
+        # 密码池里没有正确密码
+        sz = SevenZip(SEVENZIP)
+        recs, failed, _ = extract.extract_batch(
+            cfg, sz, self.quiet_log, scan_root=arc.parent)
+        # 强制解压被跳过 → 报失败（密码错误），而不是假成功
+        self.assertTrue(all(r.result == "失败" for r in recs if r.op == "解压"))
+        # 未产生任何 0KB 垃圾文件（只剩原压缩包）
+        leftovers = [p for p in arc.parent.rglob("*") if p.is_file()]
+        self.assertEqual(leftovers, [arc])
+        # 原压缩包未被删除
+        self.assertTrue(arc.is_file() and arc.stat().st_size > 0)
+
+    def test_force_not_needed_with_correct_password(self):
+        """正确密码在池中时正常解压，与强制解压无关。"""
+        arc = self._make_encrypted()
+        cfg = Config(self.work / "config.json")
+        cfg.data.update(seven_zip_path=SEVENZIP, force_extract=True)
+        cfg.add_password("右密码")
+        sz = SevenZip(SEVENZIP)
+        recs, _, _ = extract.extract_batch(
+            cfg, sz, self.quiet_log, scan_root=arc.parent)
+        self.assertTrue(any(r.result == "成功" for r in recs))
+        self.assertTrue((arc.parent / "data.bin").is_file())
+        self.assertEqual((arc.parent / "data.bin").stat().st_size, 120000)
 
 
 class TestRenameDefaultAndUndo(TempDirTestCase):
