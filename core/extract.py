@@ -524,7 +524,9 @@ def extract_one(
     if out_dir.exists() and any(out_dir.iterdir()):
         log(f"    注意：目标目录已有文件，重名文件将被 -y 覆盖：{out_dir}", "warn")
 
-    # 真正解压（WinRAR 回退时用同一引擎，避免 7z 再次失败）
+    # 真正解压（WinRAR 回退时用同一引擎，避免 7z 再次失败）。
+    # 强制模式先拍产物快照，失败时用差集判断是否真的抢救出了新文件
+    pre_snapshot = _nonempty_files(out_dir) if force else set()
     if file_progress:
         file_progress(0)
     if unrar_engine is not None:
@@ -550,13 +552,23 @@ def extract_one(
     if not result.ok:
         reason = SevenZip.classify_failure(result.output, archive)
         if force:
-            # 强制解压：分卷缺失/损坏导致解压出错，仍保留已解出的部分并记为成功
+            # 强制解压：解压出错时先检查产物——只有真正抢救出非空文件才算
+            # "强制成功"。全是 0KB/什么都没解出来就是彻底失败（典型于密码
+            # 不对或首卷即损），必须记失败，且绝不删除原压缩包（本分支
+            # 提前 return，永远走不到下方的删源逻辑，源文件天然安全）
+            salvaged = len(_nonempty_files(out_dir) - pre_snapshot)
             elapsed = time.time() - start
+            if salvaged == 0:
+                log(f"[失败] {archive.name}：强制解压未抢救出任何有效文件"
+                    f"（{reason}），已按失败处理，原压缩包保留", "error")
+                return ExtractRecord(str(archive), "失败",
+                                     f"强制解压无有效产物：{reason}",
+                                     password=hit_password, elapsed=elapsed)
             pwd_note = f"（密码：{hit_password}）" if hit_password else "（无密码）"
             log(f"[强制完成] {archive.name} → {out_dir} {pwd_note}：解压出错"
-                f"（{reason}），已强制保留部分结果", "warn")
+                f"（{reason}），已抢救出 {salvaged} 个非空文件（原压缩包保留）", "warn")
             return ExtractRecord(str(archive), "成功",
-                                 f"强制解压（可能不完整）：{reason}",
+                                 f"强制解压（可能不完整，抢救 {salvaged} 个文件）：{reason}",
                                  password=hit_password, elapsed=elapsed,
                                  out_dir=str(out_dir))
         log(f"[失败] {archive.name}：解压阶段出错（{reason}）", "error")
@@ -627,6 +639,22 @@ def _try_unrar_fallback(
             return unrar, pwd
     log("    [WinRAR] 全部候选密码也未通过", "warn")
     return None, ""
+
+
+def _nonempty_files(out_dir: Path) -> set[Path]:
+    """列出目录下所有非空文件。强制解压前后各拍一次快照，差集即真正
+    抢救出来的新文件（原地解压时源压缩包也在输出目录里，不能算产物）。"""
+    found: set[Path] = set()
+    try:
+        for p in out_dir.rglob("*"):
+            try:
+                if p.is_file() and p.stat().st_size > 0:
+                    found.add(p)
+            except OSError:
+                continue
+    except OSError:
+        pass
+    return found
 
 
 def _free_space(path: Path) -> Optional[int]:

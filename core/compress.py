@@ -90,6 +90,26 @@ def _free_space(path: Path) -> Optional[int]:
         return None
 
 
+def _cleanup_partial(out_dir: Path, name: str, ext: str,
+                     log: Callable[[str, str], None]) -> None:
+    """压缩失败后清理残缺产物（单包及 .001/.002 等分卷），避免半成品
+    被后续跳过模式当成"已存在"而永远不再重压。"""
+    prefix = f"{name}.{ext}"
+    try:
+        candidates = [p for p in out_dir.iterdir() if p.is_file() and
+                      (p.name == prefix or
+                       (p.name.startswith(prefix + ".") and
+                        p.name[len(prefix) + 1:].isdigit()))]
+    except OSError:
+        return
+    for p in candidates:
+        try:
+            p.unlink()
+            log(f"    已清理残缺产物：{p.name}", "info")
+        except OSError as e:
+            log(f"    残缺产物清理失败 {p.name}：{e}", "warn")
+
+
 def compress_one(
     folder: Path,
     out_dir: Path,
@@ -154,10 +174,31 @@ def compress_one(
     )
     if not result.ok:
         log(f"[失败] {folder.name}：压缩出错\n{result.output[-300:]}", "error")
-        return CompressRecord(str(folder), "失败", "7z 压缩失败",
+        _cleanup_partial(out_dir, folder.name, ext, log)
+        return CompressRecord(str(folder), "失败", "7z 压缩失败（残缺产物已清理）",
                               elapsed=time.time() - start)
 
-    # 可选：删除源文件夹（装了 send2trash 则进回收站可恢复）
+    # 压缩后校验（删源的前提）：7z a 返回 0 不代表产物完好——内存不足、磁盘
+    # 写错误等都可能产出体积异常的小包。先 7z t 完整性测试，再对比包内未压缩
+    # 总大小与源目录大小，两关都过才认定成功
+    password = config.data.get("compress_password", "")
+    verify_target = out_dir / f"{folder.name}.{ext}.001" if volume_size else out_file
+    log(f"    校验压缩包 {verify_target.name} ...", "info")
+    ver = sz.test(verify_target, password, progress_cb=file_progress)
+    lr = sz.list_archive(verify_target, password) if ver.ok else None
+    # 允许 1% 误差（文件系统统计与包内记录的微小出入）
+    size_ok = lr is not None and lr.ok and lr.total_size >= int(src_size * 0.99)
+    if not ver.ok or not size_ok:
+        got = lr.total_size if (lr and lr.ok) else 0
+        reason = (f"压缩产物校验未通过（包内 {got / 1024 ** 2:.1f} MB，"
+                  f"源 {src_size / 1024 ** 2:.1f} MB），源文件夹保留")
+        log(f"[失败] {folder.name}：{reason}", "error")
+        _cleanup_partial(out_dir, folder.name, ext, log)
+        return CompressRecord(str(folder), "失败", reason,
+                              elapsed=time.time() - start)
+
+    # 可选：删除源文件夹（装了 send2trash 则进回收站可恢复）。
+    # 只有上方校验全部通过才会走到这里——绝不删除未经校验的源
     deleted_note = ""
     if config.data.get("compress_delete_source", False):
         use_recycle = config.data.get("delete_to_recycle", True) and _send2trash is not None

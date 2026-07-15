@@ -162,6 +162,10 @@ class SevenZip:
         """
         args = ["a", f"-t{fmt}", str(archive), str(source),
                 f"-mx={level}", "-y", "-bsp1"]
+        if fmt == "7z":
+            # 限制 LZMA2 词典与线程数，防止大文件夹压缩时内存暴涨导致
+            # 系统卡死/压缩失败（默认高级别词典 + 多线程可吃掉数 GB 内存）
+            args += ["-md=32m", "-mmt=2"]
         if password:
             args.append(f"-p{password}")
             if fmt == "7z" and header_encrypt:

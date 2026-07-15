@@ -861,6 +861,15 @@ class _MissingVolume7z(SevenZip):
         return SevenZipResult(2, "ERROR: Missing volume : game.002")
 
 
+class _EmptyOutput7z(_MissingVolume7z):
+    """模拟强制解压只产出 0KB 垃圾（密码不对/首卷即损的典型表现）。"""
+
+    def extract(self, archive, out_dir, password="", progress_cb=None):
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
+        (Path(out_dir) / "垃圾.bin").write_bytes(b"")   # 0 字节
+        return SevenZipResult(2, "ERROR: Data error")
+
+
 class TestForceExtract(TempDirTestCase):
     def _make_item(self):
         d = self.work / "ext"
@@ -890,6 +899,19 @@ class TestForceExtract(TempDirTestCase):
         self.assertIn("强制解压", rec.detail)
         self.assertTrue((d / "部分文件.bin").exists())
         self.assertTrue(any("强制" in m for m in logs))
+
+    def test_force_with_zero_output_reports_failure(self):
+        """回归：强制解压产物全为 0KB 时必须记失败，源文件不删。"""
+        item, d = self._make_item()
+        cfg = Config(self.work / "config.json")
+        cfg.data["force_extract"] = True
+        cfg.data["delete_after_extract"] = True   # 即使开了删源
+        cfg.data["delete_to_recycle"] = False
+        rec = extract.extract_one(item, cfg, _EmptyOutput7z("dummy_7z"),
+                                  self.quiet_log)
+        self.assertEqual(rec.result, "失败")
+        self.assertIn("无有效产物", rec.detail)
+        self.assertTrue((d / "游戏.7z").is_file())   # 源包完好
 
     def test_force_does_not_fallback_unrar(self):
         """强制模式按用户要求不回退 UnRAR：即使配置了 UnRAR 也不调用它。"""
@@ -973,6 +995,41 @@ class TestCompressFlow(TempDirTestCase):
         self.assertEqual({r.result for r in records}, {"成功"})
         self.assertTrue((out / "游戏A.zip").is_file())
         self.assertTrue((out / "游戏B.zip").is_file())
+
+    def test_bad_archive_never_deletes_source(self):
+        """回归：压缩产物校验不过时绝不删源，且清理残缺产物。
+
+        模拟"7z a 返回 0 但产物是坏的"（内存不足等场景）：add 只写一个
+        几字节的假包。删源开着也必须保住源文件夹。"""
+        class _Broken7z(SevenZip):
+            def add(self, archive, source, password="", level=5, fmt="7z",
+                    header_encrypt=True, volume_size="", progress_cb=None):
+                Path(archive).write_bytes(b"7z\xbc\xaf\x27\x1cbad")
+                return SevenZipResult(0, "Everything is Ok")   # 谎报成功
+
+        cfg = self._cfg(compress_delete_source=True)
+        records, _ = compress.compress_batch(
+            cfg, _Broken7z(SEVENZIP), self.quiet_log, scan_root=self.src)
+        self.assertEqual({r.result for r in records}, {"失败"})
+        for r in records:
+            self.assertIn("校验未通过", r.detail)
+        # 源文件夹完好
+        self.assertTrue((self.src / "游戏A" / "readme.txt").is_file())
+        self.assertTrue((self.src / "游戏B" / "readme.txt").is_file())
+        # 残缺产物已清理，跳过模式不会误判"已存在"
+        self.assertFalse((self.src / "游戏A.7z").exists())
+        self.assertFalse((self.src / "游戏B.7z").exists())
+
+    def test_delete_source_only_after_verify(self):
+        """删源开启 + 真实 7z：校验通过后才删源，产物可完整还原。"""
+        cfg = self._cfg(compress_delete_source=True)
+        cfg.data["delete_to_recycle"] = False
+        sz = SevenZip(SEVENZIP)
+        records, _ = compress.compress_batch(
+            cfg, sz, self.quiet_log, scan_root=self.src)
+        self.assertEqual({r.result for r in records}, {"成功"})
+        self.assertFalse((self.src / "游戏A").exists())   # 源已删
+        self.assertTrue(sz.test(self.src / "游戏A.7z").ok)  # 产物完好
 
     def test_encrypted_compress_needs_password(self):
         """加密压缩：无密码测试应失败，正确密码通过。"""
